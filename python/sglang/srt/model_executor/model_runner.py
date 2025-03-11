@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
     set_use_cpu,
+    update_config,
 )
 
 _is_hip = is_hip()
@@ -155,7 +156,6 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
-        self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
@@ -167,6 +167,9 @@ class ModelRunner:
         self.tp_size = tp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        if self.device == "cpu":
+            model_config = update_config(model_config, self.tp_size)
+        self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
