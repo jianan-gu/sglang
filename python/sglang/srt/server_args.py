@@ -272,6 +272,15 @@ class ServerArgs:
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
+        if self.device == "cpu":
+            if self.attention_backend is None:
+                self.attention_backend = "intel_amx"
+            self.sampling_backend = "pytorch"
+
+        if self.attention_backend is None:
+            self.attention_backend = (
+                "flashinfer" if is_flashinfer_available() else "triton"
+            )
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -817,7 +826,11 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
+<<<<<<< HEAD
             choices=["flashinfer", "triton", "torch_native", "fa3"],
+=======
+            choices=["flashinfer", "triton", "torch_native", "intel_amx"],
+>>>>>>> 7693668c (Add intel_amx backend for Radix Attention, including extend attention and decode attention kernel (#9))
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
