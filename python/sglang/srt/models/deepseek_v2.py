@@ -26,6 +26,11 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from sglang.srt.cpu_utils import (
+    PackWeightMethod,
+    cpu_has_amx_support,
+    prepack_weight_if_needed,
+)
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -73,6 +78,9 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
+
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -154,8 +162,12 @@ class MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        self.quant_method = PackWeightMethod(weight_names=["weight"])
 
     def forward(self, hidden_states):
+        if self.use_intel_amx_backend:
+            return sgl_kernel.cpu.weight_packed_linear(hidden_states, self.weight, None)
+
         logits = F.linear(hidden_states, self.weight, None)
         return logits
 
