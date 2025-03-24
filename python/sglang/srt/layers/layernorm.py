@@ -31,6 +31,10 @@ if _is_cuda:
         rmsnorm,
     )
 
+from sglang.srt.cpu_utils import cpu_has_amx_support
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
+
 from sglang.srt.custom_op import CustomOp
 
 logger = logging.getLogger(__name__)
@@ -76,6 +80,21 @@ class RMSNorm(CustomOp):
             return x
         else:
             return x, residual
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if cpu_has_amx_support():
+            if residual is not None:
+                sgl_kernel.cpu.fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            out = torch.empty_like(x)
+            sgl_kernel.cpu.rmsnorm(out, x, self.weight.data, self.variance_epsilon)
+            return out
+        else:
+            return self.forward_native(x, residual)
 
 
 class GemmaRMSNorm(CustomOp):
@@ -141,6 +160,6 @@ class Gemma3RMSNorm(nn.Module):
 
 if not _is_cuda:
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
