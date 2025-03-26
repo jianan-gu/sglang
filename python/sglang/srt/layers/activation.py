@@ -28,6 +28,10 @@ _is_cuda = is_cuda_available()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+from sglang.srt.cpu_utils import cpu_has_amx_support
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
+
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
@@ -52,6 +56,15 @@ class SiluAndMul(CustomOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if cpu_has_amx_support():
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            sgl_kernel.cpu.silu_and_mul(out, x)
+            return out
+        else:
+            return self.forward_native(x)
 
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
@@ -169,6 +182,6 @@ def get_act_fn(
 
 if not _is_cuda:
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
