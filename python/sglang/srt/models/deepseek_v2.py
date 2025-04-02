@@ -736,13 +736,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
         )
         self.qkv_proj_with_rope_is_int8 = None
-        if self.q_a_proj.weight.dtype == torch.int8:
-            assert (
-                self.q_a_proj.weight.dtype
-                == self.q_b_proj.weight.dtype
-                == self.kv_a_proj_with_mqa.weight.dtype
-            )
-            self.qkv_proj_with_rope_is_int8 = True
+        if self.q_lora_rank is not None:
+            if self.q_a_proj.weight.dtype == torch.int8:
+                assert (
+                    self.q_a_proj.weight.dtype
+                    == self.q_b_proj.weight.dtype
+                    == self.kv_a_proj_with_mqa.weight.dtype
+                )
+                self.qkv_proj_with_rope_is_int8 = True
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
@@ -770,6 +771,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not forward_batch.forward_mode.is_draft_extend()
                 and sum(forward_batch.extend_prefix_lens_cpu) == 0
             )
+
 
 
     def forward(
