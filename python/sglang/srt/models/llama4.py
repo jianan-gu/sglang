@@ -255,7 +255,7 @@ class Llama4Attention(nn.Module):
             attn_scale = self._get_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch).view(q.size(0), -1)
         output, _ = self.o_proj(attn_output)
         return output
 

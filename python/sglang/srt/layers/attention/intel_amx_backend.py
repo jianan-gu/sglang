@@ -114,7 +114,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             o,
             k,
             v,
-            forward_batch.out_cache_loc,
+            forward_batch.out_cache_loc.to(torch.int),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,

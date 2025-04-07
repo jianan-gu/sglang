@@ -232,6 +232,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
     ) -> torch.Tensor:
@@ -255,7 +256,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
-                topk_weights,
+                topk_weights.to(torch.float),
                 topk_ids,
                 inplace=False, # See [Note] inplace should be False in fused_experts.
             )
@@ -272,6 +273,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 custom_routing_function,
                 correction_bias,
                 activation,
+                apply_router_weight_on_input,
                 inplace,
                 no_combine,
             )

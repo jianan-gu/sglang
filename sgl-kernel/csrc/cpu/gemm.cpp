@@ -227,8 +227,8 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg) {
-
-  if (brg) {
+  
+  if (N < 64 || brg) {
     brgemm<scalar_t, has_bias>::apply(
         A, B, C, Ctmp, bias,
         M, N, K, lda, ldb, ldc);
