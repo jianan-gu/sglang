@@ -192,6 +192,13 @@ class Llama4Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
+        # self.o_proj = RowParallelLinear(
+        #     input_size=config.num_attention_heads_o * self.head_dim,
+        #     output_size=hidden_size,
+        #     bias=bias_o_proj,
+        #     quant_config=quant_config,
+        #     prefix=add_prefix("o_proj", prefix),
+        # )
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
         if is_gguf and config.model_type in ["llama", "llama4"]:

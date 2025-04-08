@@ -1130,11 +1130,39 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
-            # bitsandbytes loads the weights of the specific portion
-            # no need to narrow here
-            if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            tp_size = get_tensor_model_parallel_world_size()
+            full_shard_size = shard_size * tp_size
+            if full_shard_size > loaded_weight.size(output_dim) and start_idx >= loaded_weight.size(output_dim):
+                pad_size = start_idx + shard_size - loaded_weight.size(output_dim)
+                
+                pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=output_dim).to(loaded_weight.dtype)
+                if not use_bitsandbytes_4bit and not self.use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, shard_size
+                    )
+            else:
+                actual_shard_size = get_actual_shard_size(
+                    shard_size, start_idx, loaded_weight.size(output_dim)
+                )
+                
+                # bitsandbytes loads the weights of the specific portion
+                # no need to narrow here
+                if not use_bitsandbytes_4bit and not self.use_presharded_weights:
+                    # loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, actual_shard_size
+                    )
 
+                # See [Note] Reset padded weights to zero.
+                reset_param_data_if_needed(
+                    param_data,
+                    output_dim,
+                    actual_shard_size,
+                    shard_size - actual_shard_size,
+                )
+
+                param_data = param_data.narrow(output_dim, 0, actual_shard_size)
         # Special case for for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
@@ -1275,18 +1303,29 @@ class RowParallelLinear(LinearBase):
         ):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            actual_shard_size = get_actual_shard_size(
-                shard_size, start_idx, loaded_weight.size(input_dim)
-            )
-            loaded_weight = loaded_weight.narrow(
-                input_dim, start_idx, actual_shard_size
-            )
+            tp_size = get_tensor_model_parallel_world_size()
+            full_shard_size = shard_size * tp_size
+            if full_shard_size > loaded_weight.size(input_dim) and start_idx >= loaded_weight.size(input_dim):
+                pad_size = start_idx + shard_size - loaded_weight.size(input_dim)
+                pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=input_dim).to(loaded_weight.dtype)
+                loaded_weight = loaded_weight.narrow(
+                    input_dim, start_idx, shard_size
+                )
+            else:
+                actual_shard_size = get_actual_shard_size(
+                    shard_size, start_idx, loaded_weight.size(input_dim)
+                )
 
-            # See [Note] Reset padded weights to zero.
-            reset_param_data_if_needed(
-                param_data, input_dim, actual_shard_size, shard_size - actual_shard_size
-            )
-            param_data = param_data.narrow(input_dim, 0, actual_shard_size)
+                loaded_weight = loaded_weight.narrow(
+                    input_dim, start_idx, actual_shard_size
+                )
+
+                # See [Note] Reset padded weights to zero.
+                reset_param_data_if_needed(
+                    param_data, input_dim, actual_shard_size, shard_size - actual_shard_size
+                )
+                param_data = param_data.narrow(input_dim, 0, actual_shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).

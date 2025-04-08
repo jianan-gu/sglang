@@ -69,10 +69,18 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         # rotary embeds should be sliced
         if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
+            if hasattr(self.language_model.config, "num_key_value_heads_ori") and self.language_model.config.num_key_value_heads > self.language_model.config.num_key_value_heads_ori:
+                pad_ic = (self.language_model.config.num_key_value_heads-self.language_model.config.num_key_value_heads_ori)*self.language_model.config.head_dim
+                pad_tensor = torch.zeros(pad_ic, loaded_weight.size(-1)).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=0).to(loaded_weight.dtype)
             loaded_weight = permute(
                 loaded_weight, self.language_model.config.num_key_value_heads
             )
         elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
+            if hasattr(self.language_model.config, "num_attention_heads_ori") and self.language_model.config.num_attention_heads > self.language_model.config.num_attention_heads_ori:
+                pad_ic = (self.language_model.config.num_attention_heads-self.language_model.config.num_attention_heads_ori)*self.language_model.config.head_dim
+                pad_tensor = torch.zeros(pad_ic, loaded_weight.size(-1)).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=0).to(loaded_weight.dtype)
             loaded_weight = permute(
                 loaded_weight, self.language_model.config.num_attention_heads
             )
