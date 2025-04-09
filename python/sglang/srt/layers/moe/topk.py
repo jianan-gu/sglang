@@ -28,6 +28,8 @@ _is_hip = is_hip()
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 from sglang.srt.cpu_utils import cpu_has_amx_support
+from sglang.srt.utils import get_compiler_backend
+
 if cpu_has_amx_support():
     import sgl_kernel.cpu
 

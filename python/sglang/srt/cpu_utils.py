@@ -23,9 +23,7 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     if hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, attr_name):
         attr_value = getattr(model_config.hf_config, attr_name)
         if attr_value % intermediate_padding_size != 0:
-            attr_value = pad_vocab_size(
-                attr_value, intermediate_padding_size
-            )
+            attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
             setattr(model_config.hf_config, attr_name, attr_value)
             # setattr(model_config.hf_text_config, attr_name, attr_value)
     if hasattr(model_config, "hf_text_config") and hasattr(model_config.hf_text_config, attr_name):
