@@ -27,7 +27,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, L2Norm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -44,10 +44,27 @@ from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
 
 logger = logging.getLogger(__name__)
 
+import sgl_kernel
 
 class Llama4MoE(nn.Module):
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    # @torch.compile(dynamic=True, backend=get_compiler_backend())
+    # @staticmethod
+    # def custom_routing_function(
+    #     hidden_states: torch.Tensor,
+    #     gating_output: torch.Tensor,
+    #     topk: int,
+    #     renormalize: bool,
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
+    #     router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
+    #         hidden_states.dtype
+    #     )
+    #     return (
+    #         router_scores_aK.view(-1).reshape(router_scores_aK.shape),
+    #         router_indices_aK.to(torch.int32),
+    #     )
+    # @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
         hidden_states: torch.Tensor,
@@ -55,15 +72,11 @@ class Llama4MoE(nn.Module):
         topk: int,
         renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
-        router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
-            hidden_states.dtype
-        )
+        router_scores_aK, router_indices_aK = sgl_kernel.common_ops.topk_sigmoid_cpu(hidden_states, gating_output, topk)
         return (
-            router_scores_aK.view(-1).reshape(router_scores_aK.shape),
-            router_indices_aK.to(torch.int32),
+            router_scores_aK,
+            router_indices_aK,
         )
-
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -167,9 +180,16 @@ class Llama4Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.n_rep = self.num_heads // self.num_kv_heads
-        self.qk_norm = (
-            RMSNorm(
-                hidden_size=self.head_dim,
+        # self.qk_norm = (
+        #     RMSNorm(
+        #         hidden_size=self.head_dim,
+        #         eps=config.rms_norm_eps,
+        #     )
+        #     if self.use_qk_norm
+        #     else None
+        # )
+        self.qk_l2norm = (
+            L2Norm(
                 eps=config.rms_norm_eps,
             )
             if self.use_qk_norm
@@ -192,13 +212,6 @@ class Llama4Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        # self.o_proj = RowParallelLinear(
-        #     input_size=config.num_attention_heads_o * self.head_dim,
-        #     output_size=hidden_size,
-        #     bias=bias_o_proj,
-        #     quant_config=quant_config,
-        #     prefix=add_prefix("o_proj", prefix),
-        # )
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
         if is_gguf and config.model_type in ["llama", "llama4"]:
@@ -245,12 +258,12 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
 
-        if self.qk_norm is not None:
+        if self.qk_l2norm is not None:
             # TODO: support float
             q = q.reshape(-1, self.head_dim).contiguous().bfloat16()
             k = k.reshape(-1, self.head_dim).contiguous().bfloat16()
-            q = self.qk_norm(q).to(q.dtype)
-            k = self.qk_norm(k).to(k.dtype)
+            q = self.qk_l2norm(q).to(q.dtype)
+            k = self.qk_l2norm(k).to(k.dtype)
             q = q.reshape(-1, self.q_size)
             k = k.reshape(-1, self.kv_size)
 

@@ -34,11 +34,43 @@ if _is_cuda:
 from sglang.srt.cpu_utils import cpu_has_amx_support
 if cpu_has_amx_support():
     import sgl_kernel.cpu
+    import sgl_kernel
 
 from sglang.srt.custom_op import CustomOp
 
 logger = logging.getLogger(__name__)
 
+class L2Norm(CustomOp):
+    def __init__(
+        self,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.variance_epsilon = eps
+        self._has_amx_support = cpu_has_amx_support()
+        if self._has_amx_support:
+            self.cpu_l2norm = sgl_kernel.common_ops.l2norm_cpu
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = x.to(orig_dtype)
+        return x
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self._has_amx_support:
+            eps = self.variance_epsilon
+            return self.cpu_l2norm(x, eps)
+        else:
+            return self.forward_native(x)
 
 class RMSNorm(CustomOp):
     def __init__(
