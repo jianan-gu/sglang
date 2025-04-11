@@ -246,6 +246,7 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
 void rotary_embedding_cpu(at::Tensor& positions, at::Tensor& query,
   at::Tensor& key, int64_t head_size,
   at::Tensor& cos_sin_cache, bool is_neox) {
+    RECORD_FUNCTION("sgl-kernel::rotary_embedding_cpu", std::vector<c10::IValue>({key}));
 int num_tokens = positions.numel();
 int rot_dim = cos_sin_cache.size(1);
 int num_heads = query.size(-1) / head_size;

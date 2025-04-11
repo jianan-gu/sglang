@@ -1,3 +1,4 @@
+#pragma once
 #include <immintrin.h>
 #include <torch/all.h>
 
