@@ -18,7 +18,7 @@
 
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+from sglang.srt.cpu_utils import cpu_has_amx_support
 import torch
 from torch import nn
 from transformers import Llama4TextConfig
@@ -117,17 +117,35 @@ class Llama4MoE(nn.Module):
             prefix=add_prefix("shared_expert", prefix),
             reduce_results=False,  # We need to do scatter before reduce
         )
-
+        if self.shared_expert.gate_up_proj.weight.dtype == torch.int8:
+            self.shared_experts_is_int8 = True
+        self.use_intel_amx_backend =  cpu_has_amx_support()
+        self.sgl_kernel_cpu_shared_expert = sgl_kernel.cpu.shared_expert
     def forward(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
-        shared_out = self.shared_expert(hidden_states)
         routed_out = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        out_aD = routed_out + shared_out
-
+        # [Note] inplace should be False in fused_experts.
+        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
+        # While hidden_states is still needed in shared_expert.
+        if self.use_intel_amx_backend:
+            out_aD = self.sgl_kernel_cpu_shared_expert(
+                hidden_states,
+                self.shared_expert.gate_up_proj.weight,
+                self.shared_expert.down_proj.weight,
+                routed_out,
+                1.0,
+                inplace=True,
+                use_int8_w8a8=self.shared_experts_is_int8,
+                w1_scale=self.shared_expert.gate_up_proj.weight_scale if self.shared_experts_is_int8 else None,
+                w2_scale=self.shared_expert.down_proj.weight_scale if self.shared_experts_is_int8 else None,
+            )
+        else:
+            shared_out = self.shared_expert(hidden_states)
+            out_aD = routed_out + shared_out
         if self.tp_size > 1:
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 

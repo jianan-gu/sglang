@@ -5,7 +5,6 @@ from typing import Optional, Set, Tuple
 import torch
 from torch import nn
 from transformers import Llama4Config
-
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
