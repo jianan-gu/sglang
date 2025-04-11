@@ -34,6 +34,7 @@ except ImportError:
         raise ImportError("vllm is not installed")
 
 
+from sglang.srt.cpu_utils import _process_weight_after_loading, cpu_has_amx_support
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -65,6 +66,9 @@ from sglang.srt.utils import (
     print_warning_once,
     set_weight_attrs,
 )
+
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -318,6 +322,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale, requires_grad=False
                 )
                 layer.input_scale = None
+            elif layer.weight.device.type == "cpu":
+                assert (
+                    cpu_has_amx_support()
+                ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                _process_weight_after_loading(layer, ["weight"])
             else:
                 layer.weight = torch.nn.Parameter(
                     layer.weight.data, requires_grad=False
@@ -419,6 +428,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.use_marlin = False
 
         if self.block_quant:
+            if layer.use_intel_amx_backend:
+                return sgl_kernel.cpu.fp8_scaled_mm(
+                    x,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size,
+                    bias,
+                    x.dtype,
+                )
+
             return apply_w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
