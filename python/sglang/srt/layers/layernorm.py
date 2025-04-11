@@ -195,8 +195,7 @@ class Gemma3RMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
-
-if not _is_cuda:
+if not (_is_cuda or (not _is_cuda and cpu_has_amx_support())):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )

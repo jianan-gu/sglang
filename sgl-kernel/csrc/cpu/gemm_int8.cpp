@@ -365,7 +365,7 @@ at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
 // fused `per_token_quant_int8_cpu` and `int8_scaled_mm_cpu`
 at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
     std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni) {
-  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
+  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_with_quant", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
