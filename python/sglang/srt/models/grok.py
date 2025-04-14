@@ -215,7 +215,6 @@ class Grok1Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             logit_cap=logit_cap,
-            quant_config=quant_config,
         )
 
     def forward(

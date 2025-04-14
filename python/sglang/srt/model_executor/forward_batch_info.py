@@ -72,7 +72,7 @@ class ForwardMode(IntEnum):
     DUMMY_FIRST = auto()
 
     def is_prefill(self):
-        return self.is_extend()
+        return self == ForwardMode.PREFILL
 
     def is_extend(self):
         return (

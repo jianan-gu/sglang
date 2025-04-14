@@ -460,6 +460,7 @@ def pt_weights_iterator(
         state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
         del state
+        torch.cuda.empty_cache()
 
 
 def get_gguf_extra_tensor_names(

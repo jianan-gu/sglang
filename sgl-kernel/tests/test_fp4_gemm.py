@@ -2,7 +2,11 @@ import pytest
 import torch
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+if torch.cuda.get_device_capability() < (10, 0):
+    pytest.skip(
+        reason="Nvfp4 Requires compute capability of 10 or above.",
+        allow_module_level=True,
+    )
 
 DTYPES = [torch.float16, torch.bfloat16]
 # m, n, k
@@ -104,9 +108,6 @@ def get_ref_results(
     return torch.matmul(a_in_dtype, b_in_dtype.t())
 
 
-@pytest.mark.skipif(
-    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
-)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @torch.inference_mode()
@@ -148,7 +149,3 @@ def test_nvfp4_gemm(
     )
 
     torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=1e-1, rtol=1e-1)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

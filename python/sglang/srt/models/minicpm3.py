@@ -192,7 +192,6 @@ class MiniCPM3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
-            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -344,7 +343,6 @@ class MiniCPM3AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
-            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 

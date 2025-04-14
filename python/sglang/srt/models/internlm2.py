@@ -145,7 +145,6 @@ class InternLM2Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
             layer_id,
-            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 

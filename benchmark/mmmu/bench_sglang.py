@@ -86,8 +86,8 @@ def eval_mmmu(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    EvalArgs.add_cli_args(parser)
     args = add_common_sglang_args_and_parse(parser)
+    EvalArgs.add_cli_args(parser)
     args = parser.parse_args()
 
     eval_mmmu(args)

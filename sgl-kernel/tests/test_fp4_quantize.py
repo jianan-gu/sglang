@@ -2,7 +2,11 @@ import pytest
 import torch
 from sgl_kernel import scaled_fp4_quant
 
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+if torch.cuda.get_device_capability() < (10, 0):
+    pytest.skip(
+        reason="Nvfp4 Requires compute capability of 10 or above.",
+        allow_module_level=True,
+    )
 
 DTYPES = [torch.float16, torch.bfloat16]
 SHAPES = [(128, 64), (128, 128), (256, 64), (256, 128)]
@@ -111,9 +115,6 @@ def recover_swizzled_scales(scale, m, n):
     return result[:m, :scale_n]
 
 
-@pytest.mark.skipif(
-    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
-)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @torch.inference_mode()
@@ -139,9 +140,6 @@ def test_quantize_to_fp4(
     torch.testing.assert_close(scale_ans, scale_ref)
 
 
-@pytest.mark.skipif(
-    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
-)
 @pytest.mark.parametrize("pad_shape", PAD_SHAPES)
 @torch.inference_mode()
 def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
@@ -164,7 +162,3 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

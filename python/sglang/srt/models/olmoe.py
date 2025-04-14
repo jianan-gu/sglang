@@ -170,7 +170,6 @@ class OlmoeAttention(nn.Module):
             self.scaling,
             layer_id=layer_id,
             num_kv_heads=self.num_kv_heads,
-            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
