@@ -240,6 +240,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_gate_up_proj = None
         self.shared_experts_down_proj = None
         self.shared_experts_is_int8 = None
+        self.shared_experts_is_fp8 = None
         self.experts_impl = None
         self.gate_impl = None
         self.sgl_kernel_cpu_shared_expert = sgl_kernel.cpu.shared_expert
@@ -290,6 +291,10 @@ class DeepseekV2MoE(nn.Module):
                 assert self.shared_experts_down_proj.weight.dtype == torch.int8
                 self.shared_experts_is_int8 = True
 
+            if self.shared_experts_gate_up_proj.weight.dtype == torch.float8_e4m3fn:
+                assert self.shared_experts_down_proj.weight.dtype == torch.float8_e4m3fn
+                self.shared_experts_is_fp8 = True
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -311,7 +316,11 @@ class DeepseekV2MoE(nn.Module):
         has_shared_experts = self.n_shared_experts is not None
 
         assert use_intel_amx_backend == down_proj.use_intel_amx_backend
-        if has_shared_experts and use_intel_amx_backend:
+        if (
+            has_shared_experts
+            and use_intel_amx_backend
+            and not self.shared_experts_is_fp8  # TODO: remove this when FP8 shared_expert is ready
+        ):
             # [Note] inplace should be False in fused_experts.
             # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
             # While hidden_states is still needed in shared_expert.
@@ -737,6 +746,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
         )
         self.qkv_proj_with_rope_is_int8 = None
+        self.qkv_proj_with_rope_is_fp8 = None
         if self.q_lora_rank is not None:
             if self.q_a_proj.weight.dtype == torch.int8:
                 assert (
@@ -745,34 +755,13 @@ class DeepseekV2AttentionMLA(nn.Module):
                     == self.kv_a_proj_with_mqa.weight.dtype
                 )
                 self.qkv_proj_with_rope_is_int8 = True
-        self.flashinfer_mla_disable_ragged = global_server_args_dict[
-            "flashinfer_mla_disable_ragged"
-        ]
-        self.attention_backend = global_server_args_dict["attention_backend"]
-        self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
-
-    def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.attention_backend == "flashinfer":
-            # Flashinfer MLA: Do not absorb when enabling ragged prefill
-            return (
-                not self.flashinfer_mla_disable_ragged
-                and forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
-            )
-        elif self.attention_backend == "fa3":
-            # Flash Attention: Keep absorbing for all extend/decode
-            return False
-        else:
-            # Triton: Use normal computation for prefill and use weight absorption for extend/decode
-            return (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
-            )
-
+            if self.q_a_proj.weight.dtype == torch.float8_e4m3fn:
+                assert (
+                    self.q_a_proj.weight.dtype
+                    == self.q_b_proj.weight.dtype
+                    == self.kv_a_proj_with_mqa.weight.dtype
+                )
+                self.qkv_proj_with_rope_is_fp8 = True
 
 
     def forward(
@@ -801,7 +790,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
             else:
-                if self.q_lora_rank is not None and self.use_intel_amx_backend:
+                if (
+                    self.q_lora_rank is not None
+                    and self.use_intel_amx_backend
+                    and not self.qkv_proj_with_rope_is_fp8  # TODO: remove this when forward_absorb_fused_mla_rope_cpu is ready
+                ):
                     return self.forward_absorb_fused_mla_rope_cpu(
                         positions, hidden_states, forward_batch
                     )
