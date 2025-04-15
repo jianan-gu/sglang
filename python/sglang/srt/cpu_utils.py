@@ -6,6 +6,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.configs.load_config import LoadConfig
 
 from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
@@ -17,6 +18,27 @@ try:
     is_intel_amx_backend_available = True
 except:
     is_intel_amx_backend_available = False
+
+
+def get_moe_padding_size(model_config, load_config):
+    from sglang.srt.model_loader.loader import _get_quantization_config
+
+    quant_config = _get_quantization_config(model_config, load_config)
+
+    if quant_config is not None and hasattr(quant_config, "weight_block_size"):
+        # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+        weight_block_size = getattr(quant_config, "weight_block_size")
+
+        assert (
+            len(weight_block_size) == 2
+        ), "Only len(weight_block_size) == 2 is supported"
+        assert (
+            weight_block_size[0] == weight_block_size[1]
+        ), "Only weight_block_size[0] == weight_block_size[1] is supported"
+
+        return weight_block_size[0]
+
+    return DEFAULT_MOE_PADDING_SIZE
 
 
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
@@ -37,7 +59,9 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     return model_config
 
 
-def update_config(model_config: ModelConfig, tp_size: int) -> ModelConfig:
+def update_config(
+    model_config: ModelConfig, load_config: LoadConfig, tp_size: int
+) -> ModelConfig:
     # Support the case where the num_attention_heads is not divisible by the TP size.
     if model_config.num_attention_heads % tp_size != 0:
         model_config.hf_config.num_attention_heads_ori = model_config.num_attention_heads
