@@ -43,7 +43,17 @@ from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
 
 logger = logging.getLogger(__name__)
+import os
+def get_int_from_env(env_keys, default):
+    """Returns the first positive env value found in the `env_keys` list or the default."""
+    for e in env_keys:
+        val = int(os.environ.get(e, -1))
+        if val >= 0:
+            return val
+    return default
 
+
+is_moe_quant_only = get_int_from_env(["MOE_QUANT_ONLY"], "0") == 1
 import sgl_kernel
 
 class Llama4MoE(nn.Module):
@@ -113,7 +123,7 @@ class Llama4MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size_moe,
             hidden_act="silu",
-            quant_config=quant_config,
+            quant_config=quant_config if not is_moe_quant_only else None,
             prefix=add_prefix("shared_expert", prefix),
             reduce_results=False,  # We need to do scatter before reduce
         )
@@ -193,7 +203,7 @@ class Llama4Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.attn_temperature_tuning = False#config.attn_temperature_tuning -- enable when sequence > 128k
+        self.attn_temperature_tuning = config.attn_temperature_tuning #-- enable when sequence > 128k
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
         self.rope_theta = rope_theta
@@ -220,7 +230,7 @@ class Llama4Attention(nn.Module):
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=quant_config if not is_moe_quant_only else None,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -228,7 +238,7 @@ class Llama4Attention(nn.Module):
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias_o_proj,
-            quant_config=quant_config,
+            quant_config=quant_config if not is_moe_quant_only else None,
             prefix=add_prefix("o_proj", prefix),
         )
         is_neox_style = True
@@ -340,7 +350,7 @@ class Llama4DecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size_mlp,
                 hidden_act="silu",
-                quant_config=quant_config,
+                quant_config=quant_config if not is_moe_quant_only else None,
                 prefix=add_prefix("feed_forward", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -387,7 +397,7 @@ class Llama4Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            quant_config=quant_config if not is_moe_quant_only else None,
             prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = make_layers(
