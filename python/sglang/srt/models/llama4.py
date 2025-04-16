@@ -203,7 +203,7 @@ class Llama4Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.attn_temperature_tuning = config.attn_temperature_tuning #-- enable when sequence > 128k
+        self.attn_temperature_tuning = False #config.attn_temperature_tuning -- enable when sequence > 128k
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
         self.rope_theta = rope_theta
