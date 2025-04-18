@@ -83,12 +83,12 @@ sh run_llama4_quant.sh {origin_model_path}  {quant_model_dir} # the quantized mo
 ```sh
 # TP = 6, 43 OpenMP threads of rank0 are bound on 0-42 CPU cores, and the OpenMP threads of rank1 are bound on 43-85 CPU cores, etc.
 
-# download prompts first
-wget llama4_prompt.json
+# download prompts files first
+wget https://intel-extension-for-pytorch.s3.us-east-1.amazonaws.com/miscellaneous/llm/prompt_llama4.json
 
-# {Quantized_model_path} is based on above Quantization stage, example: ./quant_model_dir/Llama-4-Maverick-17B-128E-Instruct-w8g-1
+# {Quantized_model_path} is based on the above Quantization stage, example: ./quant_model_dir/Llama-4-Maverick-17B-128E-Instruct-w8g-1
 Command:
-MOE_QUANT_ONLY=1 SGLANG_CPU_OMP_THREADS_BIND="0-42|43-85|86-127|128-170|171-213|214-255" python -m sglang.bench_one_batch --batch-size 1 --input 1024 --output 1024 --model {Quantized_model_path} --trust-remote-code --device cpu --mem-fraction-static 0.8 --tp=6  --quantization w8a8_int8 --max-total-tokens 65536 --prompt-filename llama4_prompt.json
+MOE_QUANT_ONLY=1 SGLANG_CPU_OMP_THREADS_BIND="0-42|43-85|86-127|128-170|171-213|214-255" python -m sglang.bench_one_batch --batch-size 1 --input 1024 --output 1024 --model {Quantized_model_path} --trust-remote-code --device cpu --mem-fraction-static 0.8 --tp=6  --quantization w8a8_int8 --max-total-tokens 65536 --prompt-filename prompt_llama4.json
 
 # Notes: to get max throughput, "--batch-size " needs to be further tuned.
 ```
