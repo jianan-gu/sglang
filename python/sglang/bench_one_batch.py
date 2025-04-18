@@ -499,7 +499,7 @@ def latency_test(
         else:
             with open(bench_args.prompt_filename, 'r') as pf:
                 prompt_pool = json.load(pf)
-                prompt_dict = prompt_pool['deepseekr1'][str(bench_args.input_len[0])]
+                prompt_dict = prompt_pool[str(bench_args.input_len[0])]
                 for index in range(bench_args.batch_size[0]):
                     custom_prompts.append(prompt_dict[str(index)])
 
