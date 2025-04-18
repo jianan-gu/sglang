@@ -142,6 +142,6 @@ response = client.chat.completions.create(
     top_p=0.9,
     max_tokens=128,
 )
-print_highlight(response.choices[0].message.content)
+print(response.choices[0].message.content)
 ```
 
