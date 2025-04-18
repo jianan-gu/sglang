@@ -76,7 +76,7 @@ huggingface-cli download meta-llama/Llama-4-Maverick-17B-128E-Instruct --local-d
 We can use [AutoRound](https://github.com/intel/auto-round) which is a novel quantization approach minimizing the accuracy loss.
 
 ```sh
-git clone https://github.com/intel/auto-round/tree/enable_llama4_int8_baseline
+git clone https://github.com/intel/auto-round -b enable_llama4_int8_baseline
 cd auto-round/
 pip install -e .[cpu]
 sh run_llama4_quant.sh {origin_model_path}  {quant_model_dir} # the quantized model folder will be in {quant_model_dir}
