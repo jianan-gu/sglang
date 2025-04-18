@@ -49,12 +49,16 @@ cd ..
 ## 2. Benchmark
 
 ### 2.1 Notes
+
 The following command lines are for demonstration purposes. Modify the arguments and thread binding according to your requirements and CPU type.
-#### 2.1.1 Please avoid cross NUMA node memory access when setting SGLANG_CPU_OMP_THREADS_BIND.
 
-`SGLANG_CPU_OMP_THREADS_BIND` specifies the CPU cores dedicated to the OpenMP threads. `--tp` sets the TP size. Below examples are running with TP = 6. By changing `--tp` and `SGLANG_CPU_OMP_THREADS_BIND` accordingly, you could set TP size to other values, and specifiy the core binding for each rank.
+#### 2.1.1  Core binding and tensor parallel degree setup
 
-#### 2.1.2 Preload iomp and tcmalloc for better performance.
+The env variable `SGLANG_CPU_OMP_THREADS_BIND` specifies the CPU cores dedicated to the OpenMP threads, and argument `--tp` sets the TP size (tensor parallel degree). Below examples are running with TP = 6. By changing `--tp` and `SGLANG_CPU_OMP_THREADS_BIND` accordingly, you could set TP size to other values, and specifiy the core binding for each rank. Please be aware that cross NUMA node memory access needs to be avoided when setting `SGLANG_CPU_OMP_THREADS_BIND`, or the performance would be severrely impacted.
+
+#### 2.1.2 Preload libraries
+
+Preload iomp and tcmalloc for better performance.
 
 ```sh
 export LD_PRELOAD=${CONDA_PREFIX:-"$(dirname $(which conda))/../"}/lib/libiomp5.so:${CONDA_PREFIX:-"$(dirname $(which conda))/../"}/lib/libtcmalloc.so
@@ -68,6 +72,9 @@ huggingface-cli download meta-llama/Llama-4-Scout-17B-16E-Instruct --local-dir .
 huggingface-cli download meta-llama/Llama-4-Maverick-17B-128E-Instruct --local-dir ./origin_model_path/Llama-4-Maverick-17B-128E-Instruct
 ```
 ### 2.3 Quantization
+
+We can use [AutoRound](https://github.com/intel/auto-round) which is a novel quantization approach minimizing the accuracy loss.
+
 ```sh
 git clone https://github.com/intel/auto-round/tree/enable_llama4_int8_baseline
 cd auto-round/
