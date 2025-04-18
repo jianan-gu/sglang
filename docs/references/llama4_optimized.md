@@ -99,8 +99,9 @@ MOE_QUANT_ONLY=1 SGLANG_CPU_OMP_THREADS_BIND="0-42|43-85|86-127|128-170|171-213|
 launch SGlang server engine:
 ```sh
 # TP = 6, 43 OpenMP threads of rank0 are bound on 0-42 CPU cores, and the OpenMP threads of rank1 are bound on 43-85 CPU cores, etc.
+# {Quantized_model_path} is based on above Quantization stage, example: ./quant_model_dir/Llama-4-Maverick-17B-128E-Instruct-w8g-1
 Command:
-MOE_QUANT_ONLY=1 SGLANG_CPU_OMP_THREADS_BIND="0-42|43-85|86-127|128-170|171-213|214-255" python -m sglang.launch_server --model {PATH}  --trust-remote-code --device cpu   --tp 6 --mem-fraction-static 0.8 --max-total-tokens 65536   --chat-template llama-4 --quantization w8a8_int8
+MOE_QUANT_ONLY=1 SGLANG_CPU_OMP_THREADS_BIND="0-42|43-85|86-127|128-170|171-213|214-255" python -m sglang.launch_server --model {Quantized_model_path} --trust-remote-code --device cpu   --tp 6 --mem-fraction-static 0.8 --max-total-tokens 65536   --chat-template llama-4 --quantization w8a8_int8
 ```
 
 **Client**
