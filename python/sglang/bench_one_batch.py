@@ -506,7 +506,7 @@ def latency_test(
     if bench_args.prompt_filename != "":
         if not os.path.exists(bench_args.prompt_filename):
             rank_print(
-                f"Customer prompt file {bench_args.prompt_filename} does not exist. Using dummy data..."
+                f"Custom prompt file {bench_args.prompt_filename} does not exist. Using dummy data..."
             )
         else:
             with open(bench_args.prompt_filename, "r") as pf:
