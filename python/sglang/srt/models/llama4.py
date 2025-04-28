@@ -183,7 +183,7 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.use_rope = int((layer_id + 1) % 4 != 0)
+        self.use_rope = config.no_rope_layers[self.layer_id] if hasattr(config,"no_rope_layers") and config.no_rope_layers is not [] else int((layer_id + 1) % 4 != 0)
         self.use_qk_norm = config.use_qk_norm and self.use_rope
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
