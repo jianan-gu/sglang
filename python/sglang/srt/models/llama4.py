@@ -338,7 +338,7 @@ class Llama4DecoderLayer(nn.Module):
             bias_o_proj=False,
             prefix=add_prefix("self_attn", prefix),
         )
-        is_moe_layer = (layer_id + 1) % config.interleave_moe_layer_step == 0
+        is_moe_layer = (config.interleave_moe_layer_step != 0) and ((layer_id + 1) % config.interleave_moe_layer_step == 0)
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
                 config=config,
