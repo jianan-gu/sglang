@@ -271,6 +271,7 @@ class W8A8Int8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            torch_native=True
         )
 
         if layer.use_intel_amx_backend:
