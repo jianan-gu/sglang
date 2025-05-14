@@ -280,7 +280,7 @@ class W8A8Int8MoEMethod:
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights.to(torch.float),
-                topk_ids,
+                topk_ids.to(torch.int),
                 inplace=False, # See [Note] inplace should be False in fused_experts.
                 use_int8_w8a8=True,
                 w1_scale=layer.w13_weight_scale,
