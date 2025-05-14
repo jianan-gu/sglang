@@ -203,7 +203,7 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
+        q, k = self._apply_qk_norm(q.contiguous(), k.contiguous())
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch).view(q.size(0), -1)
         output, _ = self.o_proj(attn_output)
