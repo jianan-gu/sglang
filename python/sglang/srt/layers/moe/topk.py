@@ -59,6 +59,13 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
+    if hidden_states.device == torch.device("cpu"):
+        if cpu_has_amx_support():
+            topk_weights, topk_ids = sgl_kernel.common_ops.topk_softmax_cpu(hidden_states, gating_output, topk, renormalize)
+            return topk_weights, topk_ids
+        else:
+            return fused_topk_native(hidden_states, gating_output, topk, renormalize)
+
     if _is_cuda or _is_hip:
         from sgl_kernel import topk_softmax
     else:
