@@ -106,7 +106,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
-
+import sgl_kernel
 class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
@@ -204,7 +204,17 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q.contiguous(), k.contiguous())
-        q, k = self.rotary_emb(positions, q, k)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache.to(q.device, dtype=q.dtype)
+        sgl_kernel.common_ops.rotary_embedding_cpu(
+            positions,
+            q,
+            k,
+            self.head_dim,
+            cos_sin_cache,
+            True
+        )
+        q, k = q.contiguous(), k.contiguous()
+        # q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch).view(q.size(0), -1)
         output, _ = self.o_proj(attn_output)
         return output
