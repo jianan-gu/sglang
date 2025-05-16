@@ -198,13 +198,10 @@ enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
 enable_sm100a = os.getenv("SGL_KERNEL_ENABLE_SM100A", "0") == "1"
 cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
-<<<<<<< HEAD
-=======
 cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
 cpu_amx_int8 = version.parse(torch.__version__) >= version.parse("2.7")
 if cpu_amx_int8:
     print("Enable AMX-INT8 build on CPU kernels.")
->>>>>>> 2cfd9da4 (enable cpu build for torch 2.7)
 
 if torch.cuda.is_available():
     if cuda_version >= (12, 0) and sm_version >= 90:
@@ -246,14 +243,11 @@ extra_compile_args = {
         "-fopenmp",
     ]
 }
-<<<<<<< HEAD
-=======
 if cpu_fp8_ftz:
     extra_compile_args["cxx"].append("-DSGLANG_CPU_FP8_CVT_FTZ")
 if cpu_amx_int8:
     extra_compile_args["cxx"].append("-DSGLANG_CPU_AMX_INT8")
 
->>>>>>> 2cfd9da4 (enable cpu build for torch 2.7)
 libraries = ["c10", "torch", "torch_python"]
 cuda_libraries = ["cuda", "cublas"]
 cmdclass = {

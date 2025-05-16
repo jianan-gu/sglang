@@ -782,11 +782,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-<<<<<<< HEAD
-        # For tensor parallel attention
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(
-=======
         self.o_proj_is_int8 = None
         self.o_proj_is_fp8 = None
         self.o_proj_weight_block_size = None
@@ -827,7 +822,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             # O projection.
             self.o_proj = ReplicatedLinear(
                 self.num_heads * self.v_head_dim,
->>>>>>> a67f3bdb (Add fused forward kernel for MLA and MoE (#67))
                 self.hidden_size,
                 self.q_lora_rank,
                 bias=False,
@@ -854,28 +848,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
-<<<<<<< HEAD
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
-        # O projection.
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
-=======
             assert self.o_proj.input_is_parallel
             assert self.o_proj.reduce_results
             if self.o_proj.weight.dtype == torch.int8:
@@ -885,7 +857,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.o_proj_weight_block_size = (
                     self.o_proj.quant_method.quant_config.weight_block_size
                 )
->>>>>>> a67f3bdb (Add fused forward kernel for MLA and MoE (#67))
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
             self.hidden_size,
