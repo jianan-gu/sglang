@@ -167,6 +167,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         use_presharded_weights: bool = False,
+        use_bitsandbytes_4bit: bool = False,
         **kwargs,
     ):
 
@@ -182,19 +183,57 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             shard_size, shard_offset = self.adjust_shard_indexes_for_packing(
                 shard_offset=shard_offset, shard_size=shard_size
             )
-
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+        from sglang.srt.cpu_utils import (
+            get_actual_shard_size,
+            reset_param_data_if_needed,
+        )
         param_data = self.data
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
-        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        if not use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                self.output_dim, shard_id * shard_size, shard_size
+        tp_size = get_tensor_model_parallel_world_size()
+        full_shard_size = shard_size * tp_size
+        start_idx = shard_id * shard_size
+        if full_shard_size > loaded_weight.size(self.output_dim) and start_idx >= loaded_weight.size(self.output_dim):
+            pad_size = start_idx + shard_size - loaded_weight.size(self.output_dim)
+            pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+            loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.output_dim).to(loaded_weight.dtype)
+            if not use_bitsandbytes_4bit and not use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    self.output_dim, start_idx, shard_size
+                )
+        else:
+            actual_shard_size = get_actual_shard_size(
+                shard_size, start_idx, loaded_weight.size(self.output_dim)
             )
+            # bitsandbytes loads the weights of the specific portion
+            # no need to narrow here
+            if not use_bitsandbytes_4bit and not use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    self.output_dim, start_idx, actual_shard_size
+                )
+
+            # See [Note] Reset padded weights to zero.
+            reset_param_data_if_needed(
+                param_data,
+                self.output_dim,
+                actual_shard_size,
+                shard_size - actual_shard_size,
+            )
+
+            # param_data = param_data.narrow(self.output_dim, 0, actual_shard_size)
+        # print(shard_offset)
+        # print(shard_size)
+        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+        # if not use_presharded_weights:
+        #     loaded_weight = loaded_weight.narrow(
+        #         self.output_dim, shard_id * shard_size, shard_size
+        #     )
 
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=}, {loaded_weight.shape=}"
         param_data.copy_(loaded_weight)
+        # exit(0)
 
 
 class RowvLLMParameter(BasevLLMParameter):
@@ -226,27 +265,61 @@ class RowvLLMParameter(BasevLLMParameter):
                 get_actual_shard_size,
                 reset_param_data_if_needed,
             )
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+            if len(loaded_weight.shape) == 0:
+                loaded_weight = loaded_weight.reshape(1)
 
-            actual_shard_size = get_actual_shard_size(
-                shard_size, tp_rank * shard_size, loaded_weight.size(self.input_dim)
-            )
-            loaded_weight = loaded_weight.narrow(
-                self.input_dim, tp_rank * shard_size, actual_shard_size
-            )
+            param_data = self.data
+            # actual_shard_size = get_actual_shard_size(
+            #     shard_size, tp_rank * shard_size, loaded_weight.size(self.input_dim)
+            # )
+            # loaded_weight = loaded_weight.narrow(
+            #     self.input_dim, tp_rank * shard_size, actual_shard_size
+            # )
+            tp_size = get_tensor_model_parallel_world_size()
+            full_shard_size = shard_size * tp_size
+            shard_id = tp_rank
+            start_idx = shard_id * shard_size
+            if full_shard_size > loaded_weight.size(self.input_dim) and start_idx >= loaded_weight.size(self.input_dim):
+                pad_size = start_idx + shard_size - loaded_weight.size(self.input_dim)
+                pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.input_dim).to(loaded_weight.dtype)
+                if not use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        self.input_dim, start_idx, shard_size
+                    )
+            else:
+                actual_shard_size = get_actual_shard_size(
+                    shard_size, start_idx, loaded_weight.size(self.input_dim)
+                )
 
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
+                # bitsandbytes loads the weights of the specific portion
+                # no need to narrow here
+                if not use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        self.input_dim, start_idx, actual_shard_size
+                    )
 
-        param_data = self.data
-        # See [Note] Reset padded weights to zero.
-        reset_param_data_if_needed(
-            param_data,
-            self.input_dim,
-            actual_shard_size,
-            shard_size - actual_shard_size,
-        )
-        param_data = param_data.narrow(self.input_dim, 0, actual_shard_size)
-        assert param_data.shape == loaded_weight.shape
+                # See [Note] Reset padded weights to zero.
+                reset_param_data_if_needed(
+                    param_data,
+                    self.input_dim,
+                    actual_shard_size,
+                    shard_size - actual_shard_size,
+                )
+                param_data = param_data.narrow(self.input_dim, 0, actual_shard_size)
+
+        # # See [Note] Reset padded weights to zero.
+        # reset_param_data_if_needed(
+        #     param_data,
+        #     self.input_dim,
+        #     actual_shard_size,
+        #     shard_size - actual_shard_size,
+        # )
+        # param_data = param_data.narrow(self.input_dim, 0, actual_shard_size)
+        assert (
+            param_data.shape == loaded_weight.shape
+        ), f"{param_data.shape=}, {loaded_weight.shape=}"
         param_data.copy_(loaded_weight)
 
 
