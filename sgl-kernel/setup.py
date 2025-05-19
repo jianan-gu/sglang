@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import torch
+from packaging import version
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
@@ -151,8 +152,10 @@ sources = [
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
+    "csrc/cpu/gemm_fp8.cpp",
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/moe.cpp",
+    "csrc/cpu/moe_fp8.cpp",
     "csrc/cpu/moe_int8.cpp",
     "csrc/cpu/norm.cpp",
     "csrc/cpu/qkv_proj.cpp",
@@ -161,6 +164,7 @@ sources = [
     "csrc/cpu/interface.cpp",
     "csrc/cpu/shm.cpp",
     "csrc/cpu/torch_extension_cpu.cpp",
+    "csrc/cpu/models/deepseek.cpp",
 ]
 cuda_sources = (
     [
@@ -194,6 +198,10 @@ enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
 enable_sm100a = os.getenv("SGL_KERNEL_ENABLE_SM100A", "0") == "1"
 cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
+cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
+cpu_amx_int8 = version.parse(torch.__version__) >= version.parse("2.7")
+if cpu_amx_int8:
+    print("Enable AMX-INT8 build on CPU kernels.")
 
 if torch.cuda.is_available():
     if cuda_version >= (12, 0) and sm_version >= 90:
@@ -235,6 +243,11 @@ extra_compile_args = {
         "-fopenmp",
     ]
 }
+if cpu_fp8_ftz:
+    extra_compile_args["cxx"].append("-DSGLANG_CPU_FP8_CVT_FTZ")
+if cpu_amx_int8:
+    extra_compile_args["cxx"].append("-DSGLANG_CPU_AMX_INT8")
+
 libraries = ["c10", "torch", "torch_python"]
 cuda_libraries = ["cuda", "cublas"]
 cmdclass = {
@@ -256,6 +269,9 @@ else:
 
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
+# https://github.com/pytorch/pytorch/issues/152243
+py_limited_api = version.parse(torch.__version__) < version.parse("2.7")
+
 ext_modules = [
     Extension(
         name="sgl_kernel.common_ops",
@@ -264,7 +280,7 @@ ext_modules = [
         extra_compile_args=extra_compile_args,
         libraries=libraries,
         extra_link_args=extra_link_args,
-        py_limited_api=True,
+        py_limited_api=py_limited_api,
     ),
 ]
 

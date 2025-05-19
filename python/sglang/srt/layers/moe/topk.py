@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+# from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
@@ -28,6 +28,8 @@ _is_hip = is_hip()
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 from sglang.srt.cpu_utils import cpu_has_amx_support
+from sglang.srt.utils import get_compiler_backend
+
 if cpu_has_amx_support():
     import sgl_kernel.cpu
 
@@ -262,8 +264,8 @@ def select_experts(
     torch_native: bool = False,
 ):
     n_share_experts_fusion = 0
-    if global_server_args_dict["n_share_experts_fusion"] is not None:
-        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+    # if global_server_args_dict["n_share_experts_fusion"] is not None:
+    #     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None

@@ -55,6 +55,56 @@ void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor
     at::Tensor& extend_seq_lens, at::Tensor& extend_start_loc,
     int64_t max_len_extend, double sm_scale, double logit_cap);
 
+// fused forward_absorb for decode
+at::Tensor forward_absorb_decode_fused_cpu(
+    at::Tensor& hidden_states, // qkv_proj_with_rope
+    at::Tensor& q_a_proj_weight, // qkv_proj_with_rope
+    at::Tensor& q_b_proj_weight, // qkv_proj_with_rope
+    at::Tensor& kv_a_proj_weight, // qkv_proj_with_rope
+    at::Tensor& w_kc, // qkv_proj_with_rope
+    at::Tensor& q_a_layernorm_weight, // qkv_proj_with_rope
+    at::Tensor& kv_a_layernorm_weight, // qkv_proj_with_rope
+    at::Tensor& positions, // qkv_proj_with_rope
+    at::Tensor& cos_sin_cache, // qkv_proj_with_rope
+    at::Tensor& k_cache, // decode_attention_cpu
+    at::Tensor& v_cache, // decode_attention_cpu
+    at::Tensor& loc, // decode_attention_cpu
+    at::Tensor& attn_logits, // decode_attention_cpu
+    at::Tensor& req_to_token, // decode_attention_cpu
+    at::Tensor& req_pool_indices, // decode_attention_cpu
+    at::Tensor& seq_lens, // decode_attention_cpu
+    at::Tensor& w_vc, // bmm
+    at::Tensor& o_proj_weight, // o_proj
+    std::optional<at::Tensor>& o_proj_bias, // o_proj
+    double eps, // qkv_proj_with_rope
+    bool use_int8_w8a8, // qkv_proj_with_rope
+    bool use_fp8_w8a16, // qkv_proj_with_rope
+    double sm_scale, // decode_attention_cpu
+    double logit_cap, // decode_attention_cpu
+    int tp_k_head_num, // decode_attention_cpu
+    int qk_head_dim, // decode_attention_cpu
+    int tp_v_head_num, // decode_attention_cpu
+    int v_head_dim, // decode_attention_cpu
+    int tp_q_head_num, // decode_attention_cpu
+    int num_local_heads, // decode_attention_cpu
+    int kv_lora_rank, // decode_attention_cpu
+    int tp_size, // o_proj
+    int tp_rank, // o_proj
+    bool o_proj_use_int8_w8a8, // o_proj
+    bool o_proj_use_fp8_w8a16, // o_proj
+    at::ScalarType o_proj_out_dtype, // o_proj
+    std::optional<at::Tensor>& q_a_proj_scale, // qkv_proj_with_rope
+    std::optional<at::Tensor>& q_b_proj_scale, // qkv_proj_with_rope
+    std::optional<at::Tensor>& kv_a_proj_scale, // qkv_proj_with_rope
+    std::optional<std::vector<int64_t>> block_size, // qkv_proj_with_rope
+    std::optional<at::Tensor>& bmm_scale, // bmm
+    std::optional<c10::intrusive_ptr<c10d::ProcessGroup>> process_group, // o_proj
+    std::optional<py::object> op, // o_proj
+    std::optional<at::Tensor>& o_proj_scale, // o_proj
+    std::optional<std::vector<int64_t>> o_proj_block_size, // o_proj
+    bool is_vnni  // qkv_proj_with_rope, bmm, o_proj
+);
+
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
@@ -70,6 +120,11 @@ at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
     at::Tensor& scales1, at::Tensor& scales2,
     std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
 
+// fp8 gemm
+at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
+    at::Tensor& scales2, std::vector<int64_t> block_size,
+    std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
+
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
     std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
@@ -79,25 +134,82 @@ void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni,
     std::optional<at::Tensor>& scale);
 
 // fused moe
-at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
-    at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace, bool use_int8_w8a8,
-    std::optional<at::Tensor>& w1_scale, std::optional<at::Tensor>& w2_scale,
-    std::optional<at::Tensor>& a1_scale, std::optional<at::Tensor>& a2_scale,
+at::Tensor fused_experts_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    std::optional<at::Tensor>& w1_scale,
+    std::optional<at::Tensor>& w2_scale,
+    std::optional<std::vector<int64_t>> block_size,
+    std::optional<at::Tensor>& a1_scale,
+    std::optional<at::Tensor>& a2_scale,
     bool is_vnni);
 
-at::Tensor shared_expert_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
-    at::Tensor& fused_experts_out, double routed_scaling_factor, bool inplace, bool use_int8_w8a8,
-    std::optional<at::Tensor>& w1_scale, std::optional<at::Tensor>& w2_scale,
-    std::optional<at::Tensor>& a1_scale, std::optional<at::Tensor>& a2_scale,
+at::Tensor shared_expert_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& fused_experts_out,
+    double routed_scaling_factor,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    std::optional<at::Tensor>& w1_scale,
+    std::optional<at::Tensor>& w2_scale,
+    std::optional<std::vector<int64_t>> block_size,
+    std::optional<at::Tensor>& a1_scale,
+    std::optional<at::Tensor>& a2_scale,
     bool is_vnni);
+
+at::Tensor forward_moe_fused_cpu(
+    at::Tensor& hidden_states, // MoEGate
+    at::Tensor& MoEGate_weight, // MoEGate
+    std::optional<at::Tensor>& bias, // MoEGate
+    at::Tensor& fused_experts_w13_weight, // experts
+    at::Tensor& fused_experts_w2_weight, // experts
+    at::Tensor& shared_expert_w1, // shared_expert
+    at::Tensor& shared_expert_w2, // shared_expert
+    int top_k, // select_experts
+    bool use_grouped_topk, // select_experts
+    bool renormalize, // select_experts
+    bool fused_experts_use_int8_w8a8, // experts
+    bool fused_experts_use_fp8_w8a16, // experts
+    bool fused_experts_inplace, // experts
+    double routed_scaling_factor, // shared_expert
+    bool shared_expert_inplace, // shared_expert
+    bool shared_expert_use_int8_w8a8, // shared_expert
+    bool shared_expert_use_fp8_w8a16, // shared_expert
+    int tp_size, // all_reduce
+    std::optional<int> topk_group, // select_experts
+    std::optional<int> num_expert_group, // select_experts
+    std::optional<at::Tensor>& correction_bias, // select_experts
+    std::optional<at::Tensor>& fused_experts_w1_scale, // experts
+    std::optional<at::Tensor>& fused_experts_w2_scale, // experts
+    std::optional<at::Tensor>& fused_experts_a1_scale, // experts
+    std::optional<at::Tensor>& fused_experts_a2_scale, // experts
+    std::optional<std::vector<int64_t>> fused_experts_block_size, // experts
+    std::optional<at::Tensor>& shared_expert_w1_scale, // shared_expert
+    std::optional<at::Tensor>& shared_expert_w2_scale, // shared_expert
+    std::optional<std::vector<int64_t>> shared_expert_block_size, // shared_expert
+    std::optional<at::Tensor>& shared_expert_a1_scale, // shared_expert
+    std::optional<at::Tensor>& shared_expert_a2_scale,     // shared_expert
+    std::optional<c10::intrusive_ptr<c10d::ProcessGroup>> process_group, // all_reduce
+    std::optional<py::object> op, // all_reduce
+    bool is_vnni // MoEGate, experts, shared_expert
+);
 
 // weight absorption
 std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope( at::Tensor& hidden_states,
     at::Tensor& q_a_proj_weight, at::Tensor& q_b_proj_weight, at::Tensor& kv_a_proj_weight,
     at::Tensor& w_kc, at::Tensor& q_a_layernorm_weight, at::Tensor& kv_a_layernorm_weight,
-    at::Tensor& positions, at::Tensor& cos_sin_cache, double eps, bool use_int8_w8a8,
+    at::Tensor& positions, at::Tensor& cos_sin_cache, double eps, bool use_int8_w8a8, bool use_fp8_w8a16,
     std::optional<at::Tensor>& q_a_proj_scale, std::optional<at::Tensor>& q_b_proj_scale,
-    std::optional<at::Tensor>& kv_a_proj_scale, bool is_vnni);
+    std::optional<at::Tensor>& kv_a_proj_scale, bool is_vnni, std::optional<std::vector<int64_t>> block_size);
 
 // shared memory init
 void initialize(int size, int rank);
@@ -140,6 +252,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // extend
   m.def("extend_attention_cpu", &extend_attention_cpu, "Attention extend for CPU");
 
+  // fused forward_absorb for decode
+  m.def("forward_absorb_decode_fused_cpu", &forward_absorb_decode_fused_cpu, "fused forward_absorb for intel AMX");
+
   // weight prepack
   m.def("convert_weight_packed", &convert_weight_packed, "prepack weight to vnni format for intel AMX");
 
@@ -151,6 +266,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // igemm
   m.def("int8_scaled_mm_cpu", &int8_scaled_mm_cpu, "int8 weight packed linear for intel AMX");
+
+  // fp8 gemm
+  m.def("fp8_scaled_mm_cpu", &fp8_scaled_mm_cpu, "fp8 weight packed linear for intel AMX");
 
   // quant + igemm
   m.def("int8_scaled_mm_with_quant", &int8_scaled_mm_with_quant, "fused per row quant and int8 scaled mm for intel AMX");
@@ -166,6 +284,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // shared expert
   m.def("shared_expert_cpu", &shared_expert_cpu, "shared expert kernel for CPU");
+
+  // fused forward function for DeepseekV2MoE
+  m.def("forward_moe_fused_cpu", &forward_moe_fused_cpu, "fused MoE kernel for CPU");
 
   // all reduce
   m.def("initialize", &initialize, "shared memory initialization for CPU");
