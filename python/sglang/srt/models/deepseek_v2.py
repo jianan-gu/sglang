@@ -301,38 +301,41 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts_gate_up_proj = self.shared_experts.gate_up_proj
             self.shared_experts_down_proj = self.shared_experts.down_proj
 
-            # Cache whether shared_experts is int8
             # quantized models might not have .weight
-            if (
-                hasattr(self.shared_experts_gate_up_proj, "weight")
-                and self.shared_experts_gate_up_proj.weight.dtype == torch.int8
-            ):
-                assert self.shared_experts_down_proj.weight.dtype == torch.int8
-                self.shared_experts_is_int8 = True
+            if hasattr(self.shared_experts_gate_up_proj, "weight"):
+                # Cache whether shared_experts is int8/fp8
+                if self.shared_experts_gate_up_proj.weight.dtype == torch.int8:
+                    assert self.shared_experts_down_proj.weight.dtype == torch.int8
+                    self.shared_experts_is_int8 = True
 
-            if self.shared_experts_gate_up_proj.weight.dtype == torch.float8_e4m3fn:
-                assert self.shared_experts_down_proj.weight.dtype == torch.float8_e4m3fn
+                if self.shared_experts_gate_up_proj.weight.dtype == torch.float8_e4m3fn:
+                    assert (
+                        self.shared_experts_down_proj.weight.dtype
+                        == torch.float8_e4m3fn
+                    )
 
-                assert (
-                    self.shared_experts_gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts_down_proj.quant_method.quant_config.weight_block_size
+                    assert (
+                        self.shared_experts_gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts_down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts_gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
+
+                    self.shared_experts_is_fp8 = True
+
+        # AWQ doesn't have .w13_weight
+        if getattr(self.experts, "w13_weight", None) is not None:
+            if self.experts.w13_weight.dtype == torch.int8:
+                assert self.experts.w2_weight.dtype == self.experts.w13_weight.dtype
+                self.experts_is_int8 = True
+
+            if self.experts.w13_weight.dtype == torch.float8_e4m3fn:
+                assert self.experts.w2_weight.dtype == self.experts.w13_weight.dtype
+                self.experts_is_fp8 = True
+                self.experts_weight_block_size = (
+                    self.experts.quant_method.quant_config.weight_block_size
                 )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts_gate_up_proj.quant_method.quant_config.weight_block_size
-                )
-
-                self.shared_experts_is_fp8 = True
-
-        if self.experts.w13_weight.dtype == torch.int8:
-            assert self.experts.w2_weight.dtype == self.experts.w13_weight.dtype
-            self.experts_is_int8 = True
-
-        if self.experts.w13_weight.dtype == torch.float8_e4m3fn:
-            assert self.experts.w2_weight.dtype == self.experts.w13_weight.dtype
-            self.experts_is_fp8 = True
-            self.experts_weight_block_size = (
-                self.experts.quant_method.quant_config.weight_block_size
-            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         has_shared_experts = self.n_shared_experts is not None
@@ -850,13 +853,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             assert self.o_proj.input_is_parallel
             assert self.o_proj.reduce_results
-            if self.o_proj.weight.dtype == torch.int8:
-                self.o_proj_is_int8 = True
-            if self.o_proj.weight.dtype == torch.float8_e4m3fn:
-                self.o_proj_is_fp8 = True
-                self.o_proj_weight_block_size = (
-                    self.o_proj.quant_method.quant_config.weight_block_size
-                )
+            # AWQ doesn't have .weight
+            if hasattr(self.o_proj, "weight"):
+                if self.o_proj.weight.dtype == torch.int8:
+                    self.o_proj_is_int8 = True
+                if self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                    self.o_proj_is_fp8 = True
+                    self.o_proj_weight_block_size = (
+                        self.o_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
             self.hidden_size,
@@ -925,12 +930,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.qkv_proj_with_rope_is_int8 = None
         self.qkv_proj_with_rope_is_fp8 = None
         self.weight_block_size = None
-        if self.q_lora_rank is not None:
-            # quantized models might not have .weight
-            if (
-                hasattr(self.q_a_proj, "weight")
-                and self.q_a_proj.weight.dtype == torch.int8
-            ):
+
+        # quantized models might not have .weight
+        if self.q_lora_rank is not None and hasattr(self.q_a_proj, "weight"):
+            if self.q_a_proj.weight.dtype == torch.int8:
                 assert (
                     self.q_a_proj.weight.dtype
                     == self.q_b_proj.weight.dtype
@@ -952,6 +955,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.q_a_proj.quant_method.quant_config.weight_block_size
                 )
                 self.qkv_proj_with_rope_is_fp8 = True
+
+        # currently absorb_fused_mla_rope_cpu does not support AWQ weights
+        self.use_absorb_fused_mla_rope_cpu = self.q_lora_rank is not None and hasattr(
+            self.q_a_proj, "weight"
+        )
 
         params = MParams()
         params.q_lora_rank = self.q_lora_rank
@@ -1052,7 +1060,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return self.forward_absorb(positions, hidden_states, forward_batch)
             else:
-                if self.q_lora_rank is not None and self.use_intel_amx_backend:
+                if self.use_absorb_fused_mla_rope_cpu and self.use_intel_amx_backend:
                     if forward_batch.forward_mode.is_decode():
                         return self.forward_absorb_decode_fused_cpu(
                             positions, hidden_states, forward_batch
