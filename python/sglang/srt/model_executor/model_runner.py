@@ -350,7 +350,6 @@ class ModelRunner:
             if self.device == "cpu":
                 # Initialization of shm all_reduce
                 import sgl_kernel.common_ops
-
                 shm_comm_op = sgl_kernel.common_ops
                 # Bind OpenMP threads to CPU cores
                 if self.local_omp_cpuid != "all":
