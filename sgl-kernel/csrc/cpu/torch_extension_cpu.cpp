@@ -234,6 +234,8 @@ std::tuple<at::Tensor, at::Tensor> rotary_position_embedding_cpu(at::Tensor& t_p
 void rotary_embedding_cpu(at::Tensor& positions, at::Tensor& query,
     at::Tensor& key, int64_t head_size,
     at::Tensor& cos_sin_cache, bool is_neox);
+// CPU and memory binding
+std::string init_cpu_threads_env(const std::string& cpu_ids);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // activation
@@ -305,4 +307,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // rope
   m.def("rotary_position_embedding_cpu", &rotary_position_embedding_cpu, "rotary position embedding for CPU");
+
+  // CPU and memory binding
+  m.def("init_cpu_threads_env", &init_cpu_threads_env, "CPU and memory binding");
 }
