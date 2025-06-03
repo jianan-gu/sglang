@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     reset_param_data_if_needed,
     set_weight_attrs,
 )
+from sglang.srt.utils import narrow_padded_param_and_loaded_weight, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
