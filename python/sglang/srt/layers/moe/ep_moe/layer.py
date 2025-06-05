@@ -1,8 +1,9 @@
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import Module
+import gc
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
@@ -208,9 +209,14 @@ class EPMoE(torch.nn.Module):
             self.block_shape = None
             self.activation_scheme = None
         else:
-            self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
-                quant_config
-            )
+            if isinstance(self, EPMoESparseCPUInfer):
+                self.quant_method: Optional[QuantizeMethodBase] = (
+                    Fp8EPMoEMethodCPUInfer(quant_config)
+                )
+            else:
+                self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
+                    quant_config
+                )
             self.use_fp8_w8a8 = True
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
@@ -232,6 +238,9 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
+    def select_experts(self, **kwargs):
+        return select_experts(**kwargs)
+
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
@@ -246,7 +255,7 @@ class EPMoE(torch.nn.Module):
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = self.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
             top_k=self.top_k,
@@ -586,6 +595,575 @@ class EPMoE(torch.nn.Module):
                     param_data[expert_id] = loaded_weight
 
 
+class EPMoESparse(EPMoE):
+    # Based on EPMoE, change start_expert_id and end_expert_id to always from 0 to num of expert in this EP rank
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        params_dtype: Optional[torch.dtype] = None,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        use_per_token_if_dynamic: bool = True,
+        expert_map: dict[int, Union[int, str]] = {},
+        ep_rank: Optional[Union[int, str]] = None,
+    ):
+        expert_map = expert_map or self.create_default_expert_map(num_experts, tp_size)
+
+        self.num_experts = num_experts
+        if ep_rank is None:
+            self.ep_rank = get_tensor_model_parallel_rank()
+        else:
+            self.ep_rank = ep_rank
+
+        self.expert_id_to_local = [-1] * num_experts
+        local_expert_count = 0
+        for expert_id in range(num_experts):
+            if expert_map.get(expert_id, -1) == self.ep_rank:
+                self.expert_id_to_local[expert_id] = local_expert_count
+                local_expert_count += 1
+
+        self.expert_id_to_local_tensor = None
+
+        super().__init__(
+            local_expert_count,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            layer_id,
+            params_dtype,
+            renormalize,
+            use_grouped_topk,
+            num_expert_group,
+            topk_group,
+            quant_config,
+            1,  # create as if tp_size is 1 weights will be created as local_expert_count
+            prefix,
+            correction_bias,
+            custom_routing_function,
+            activation,
+            routed_scaling_factor,
+            use_per_token_if_dynamic,
+        )
+
+        self.num_experts = num_experts
+        self.start_expert_id = 0
+        self.end_expert_id = local_expert_count - 1
+        assert local_expert_count == self.num_experts_per_partition
+
+    def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id):
+        local_expert_id = self.expert_id_to_local[expert_id]
+        return super().weight_loader(
+            param, loaded_weight, weight_name, shard_id, local_expert_id
+        )
+
+    def select_experts(self, **kwargs):
+        topk_weights, topk_ids = select_experts(**kwargs)
+
+        return topk_weights, self.map_expertid_to_local_experts(topk_ids)
+
+    def map_expertid_to_local_experts(self, topk_ids):
+        if self.expert_id_to_local_tensor is None:
+            self.expert_id_to_local_tensor = torch.tensor(
+                self.expert_id_to_local, device=topk_ids.device
+            )
+
+        return self.expert_id_to_local_tensor[topk_ids]
+
+    def create_default_expert_map(self, num_experts, tp_size):
+        ep_size = tp_size or get_tensor_model_parallel_world_size()
+        gpu_experts_per_rank = num_experts // ep_size
+        assert num_experts == gpu_experts_per_rank * ep_size
+        expert_map_grouped = {
+            e_id: e_id // gpu_experts_per_rank for e_id in range(num_experts)
+        }
+        expert_map_balanced = {e_id: e_id % ep_size for e_id in range(num_experts)}
+        expert_map_imbalanced = {
+            e_id: 0 if e_id < 62 else 1 for e_id in range(num_experts)
+        }
+        expert_map = expert_map_balanced
+        return expert_map
+
+
+class EPMoESparseCPUInterface(EPMoESparse):
+    def forward_start(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        raise NotImplementedError()
+
+    def forward_sync(self):
+        raise NotImplementedError()
+
+    def forward(self):
+        result = self.forward_start()
+        self.forward_sync()
+        return result
+
+
+class EPMoESparseCPUEmu(EPMoESparseCPUInterface):
+    device = "cuda"
+
+    def forward_start(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
+            cpu_result = super().forward(
+                hidden_states.to(self.device),
+                router_logits.to(self.device),
+            )
+        return cpu_result
+
+    def forward_sync(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+
+    @property
+    def stream(self):
+        if not hasattr(self, "_stream"):
+            self._stream = torch.cuda.Stream()
+        return self._stream
+
+    def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id):
+        this_param = [
+            p[1] for p in self.named_parameters() if p[0] == weight_name.split(".")[-1]
+        ][0]
+        return super().weight_loader(
+            this_param, loaded_weight, weight_name, shard_id, expert_id
+        )
+
+
+class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
+    device = "cpu"
+    cpu_infer = None
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        params_dtype: Optional[torch.dtype] = None,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        use_per_token_if_dynamic: bool = True,
+        expert_map: dict[int, Union[int, str]] = {},
+        ep_rank: Optional[Union[int, str]] = None,
+    ):
+        if EPMoESparseCPUInfer.cpu_infer is None:
+            import moe_cpu_engine as cpu_engine
+
+            EPMoESparseCPUInfer.cpu_infer = cpu_engine.CPUInfer(0)
+            EPMoESparseCPUInfer.cpu_engine = cpu_engine
+
+        with torch.device(self.device):
+            super().__init__(
+                num_experts,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                layer_id,
+                params_dtype,
+                renormalize,
+                use_grouped_topk,
+                num_expert_group,
+                topk_group,
+                quant_config,
+                tp_size,
+                prefix,
+                correction_bias,
+                custom_routing_function,
+                activation,
+                routed_scaling_factor,
+                use_per_token_if_dynamic,
+                expert_map,
+                ep_rank,
+            )
+        if isinstance(self.quant_method, Fp8EPMoEMethodCPUInfer):
+            # if no need post processing, then delete to speed up.
+            if (
+                self.quant_method.quant_config.activation_scheme == "static"
+                and self.quant_method.quant_config.is_checkpoint_fp8_serialized
+            ):
+                del self.quant_method
+                self.quant_method = None
+        self.moe_config = (
+            3,  # dummy layer id
+            self.num_experts_per_partition,
+            self.top_k,
+            hidden_size,
+            intermediate_size,
+            renormalize,
+            num_expert_group,
+            topk_group,
+        )
+        self.cpu_moe = None
+        self.dummy_correction_bias = torch.nn.Parameter(
+            torch.zeros_like(self.correction_bias.data, device=self.device),
+            requires_grad=False,
+        )
+        self.cpu_hidden_states = None
+        self.cpu_sorted_topk_ids = None
+        self.cpu_sorted_topk_weights = None
+        self.cpu_result = None
+        self.cached_tensors_size = 160  # TODO: magic number
+        self.create_cpu_tensors_if_needed_from_params(
+            hidden_size, top_k, torch.bfloat16, self.cached_tensors_size
+        )
+
+    def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        if shard_id == "w2":
+            param = (
+                self.w2_weight_scale_inv
+                if "scale_inv" in weight_name
+                else self.w2_weight
+            )
+        elif shard_id in ["w1", "w3"]:
+            param = (
+                self.w13_weight_scale_inv
+                if "scale_inv" in weight_name
+                else self.w13_weight
+            )
+        else:
+            raise ValueError(f"Unknown weight: {weight_name}")
+
+        super().weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
+
+    def _create_cpu_moe_engine(self):
+        self.cpu_moe = self.cpu_engine.moe.MOE(
+            self.cpu_engine.moe.MOEConfig(*self.moe_config)
+        )
+        self.cpu_moe.set_weights(
+            self.w13_weight.data.data_ptr(),
+            self.w2_weight.data.data_ptr(),
+            self.w13_weight_scale_inv.data.data_ptr(),
+            self.w2_weight_scale_inv.data.data_ptr(),
+            self.dummy_correction_bias.data.data_ptr(),
+        )
+        del self.w13_weight
+        del self.w2_weight
+        del self.w13_weight_scale_inv
+        del self.w2_weight_scale_inv
+        del self.dummy_correction_bias
+        gc.collect()
+
+    def _sort_topk_ids(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
+        # Get the sort indices (descending order)
+        sorted_topk_ids, sort_indices = torch.sort(topk_ids, dim=1, descending=True)
+
+        # Create batch indices for gathering
+        batch_size = topk_ids.shape[0]
+        batch_indices = (
+            torch.arange(batch_size, device=topk_ids.device)
+            .unsqueeze(1)
+            .expand_as(sort_indices)
+        )
+
+        # Sort both tensors using the same ordering
+        sorted_topk_weights = topk_weights[batch_indices, sort_indices]
+
+        return sorted_topk_weights, sorted_topk_ids
+
+    def forward_start(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if self.cpu_moe is None:
+            torch.cuda.current_stream().synchronize()
+            self._create_cpu_moe_engine()
+
+        topk_weights, topk_ids = self.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            use_grouped_topk=self.use_grouped_topk,
+            renormalize=self.renormalize,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            correction_bias=self.correction_bias,
+            custom_routing_function=self.custom_routing_function,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+        sorted_topk_weights, sorted_topk_ids = self._sort_topk_ids(
+            topk_weights, topk_ids
+        )
+        n_tokens = hidden_states.shape[0]
+        if (
+            torch.cuda.is_current_stream_capturing()
+            or n_tokens <= self.cached_tensors_size
+        ):
+            assert n_tokens <= self.cached_tensors_size
+            self.fill_cpu_tensors(hidden_states, sorted_topk_ids, sorted_topk_weights)
+            self.cpu_infer.submit_with_cuda_stream(
+                torch.cuda.current_stream(hidden_states.device).cuda_stream,
+                self.cpu_moe.forward_experts(
+                    self.cpu_hidden_states.data_ptr(),
+                    self.cpu_sorted_topk_ids.data_ptr(),
+                    self.cpu_sorted_topk_weights.data_ptr(),
+                    self.cpu_result.data_ptr(),
+                    n_tokens,
+                ),
+            )
+            return self.cpu_result[:n_tokens]
+        else:
+            n_tokens = hidden_states.shape[0]
+            self.adhoc_cpu_result = torch.zeros_like(
+                hidden_states, device=self.device, pin_memory=True
+            )
+            self.adhoc_gpu_result = torch.zeros_like(
+                hidden_states, device=hidden_states.device
+            )
+            self.adhoc_hidden_states_cpu = hidden_states.to(self.device)
+            self.adhoc_sorted_topk_ids_cpu = sorted_topk_ids.to(torch.int).to(
+                self.device
+            )
+            self.adhoc_sorted_topk_weights_cpu = sorted_topk_weights.to(self.device)
+
+            self.cpu_infer.submit_with_cuda_stream(
+                torch.cuda.current_stream(hidden_states.device).cuda_stream,
+                self.cpu_moe.forward_experts(
+                    self.adhoc_hidden_states_cpu.data_ptr(),
+                    self.adhoc_sorted_topk_ids_cpu.data_ptr(),
+                    self.adhoc_sorted_topk_weights_cpu.data_ptr(),
+                    self.adhoc_cpu_result.data_ptr(),
+                    n_tokens,
+                ),
+            )
+            return self.adhoc_cpu_result
+
+    def forward_sync(self, hidden_states, cpu_result):
+        bs = hidden_states.shape[0]
+        if torch.cuda.is_current_stream_capturing() or bs <= self.cached_tensors_size:
+            self.cpu_infer.sync_with_cuda_stream(
+                torch.cuda.current_stream(hidden_states.device).cuda_stream
+            )
+            return self.gpu_result[:bs].copy_(self.cpu_result[:bs], non_blocking=True)
+        else:
+            self.cpu_infer.sync_with_cuda_stream(
+                torch.cuda.current_stream(hidden_states.device).cuda_stream
+            )
+            return self.adhoc_gpu_result.copy_(cpu_result, non_blocking=True)
+
+    def forward(self):
+        raise NotImplementedError("forward Not implemented")
+
+    def create_cpu_tensors_if_needed_from_params(
+        self, hidden_size, topk, dtype, batchsize
+    ):
+        if self.cpu_hidden_states is None:
+            self.cpu_hidden_states = torch.empty(
+                (batchsize, hidden_size),
+                dtype=dtype,
+                device=self.device,
+                pin_memory=True,
+            )
+            self.cpu_sorted_topk_ids = torch.empty(
+                (batchsize, topk),
+                dtype=torch.int32,
+                device=self.device,
+                pin_memory=True,
+            )
+            self.cpu_sorted_topk_weights = torch.empty(
+                (batchsize, topk),
+                dtype=torch.float32,
+                device=self.device,
+                pin_memory=True,
+            )
+            self.cpu_result = torch.empty(
+                (batchsize, hidden_size),
+                dtype=dtype,
+                device=self.device,
+                pin_memory=True,
+            )
+            self.gpu_result = torch.empty(
+                (batchsize, hidden_size), dtype=dtype, device="cuda"
+            )
+
+    def fill_cpu_tensors(self, hidden_states, sorted_topk_ids, sorted_topk_weights):
+        bs = hidden_states.shape[0]
+        assert bs <= self.cpu_hidden_states.shape[0]
+        self.cpu_hidden_states[:bs].copy_(hidden_states, non_blocking=True)
+        self.cpu_sorted_topk_ids[:bs].copy_(sorted_topk_ids, non_blocking=True)
+        self.cpu_sorted_topk_weights[:bs].copy_(sorted_topk_weights, non_blocking=True)
+
+
+class EPMoEHeto(EPMoESparse):
+    RANK_CPU = "C0"
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        params_dtype: Optional[torch.dtype] = None,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        use_per_token_if_dynamic: bool = True,
+        expert_map: dict[int, Union[int, str]] = {},
+        num_gpu_experts=-1,
+    ):
+        expert_map = expert_map or self.create_default_expert_map(
+            num_experts, tp_size, num_gpu_experts
+        )
+
+        self._init_cpu_resources(expert_map)
+
+        super().__init__(
+            num_experts,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            layer_id,
+            params_dtype,
+            renormalize,
+            use_grouped_topk,
+            num_expert_group,
+            topk_group,
+            quant_config,
+            tp_size,
+            prefix,
+            correction_bias,
+            custom_routing_function,
+            activation,
+            routed_scaling_factor,
+            use_per_token_if_dynamic,
+            expert_map,
+        )
+        if self.is_hosting_cpu():
+            self.cpu_moe = EPMoESparseCPUInfer(
+                num_experts,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                layer_id,
+                params_dtype,
+                renormalize,
+                use_grouped_topk,
+                num_expert_group,
+                topk_group,
+                quant_config,
+                tp_size,
+                prefix,
+                correction_bias,
+                custom_routing_function,
+                activation,
+                routed_scaling_factor,
+                use_per_token_if_dynamic,
+                expert_map,
+                EPMoEHeto.RANK_CPU,
+            )
+
+    def _init_cpu_resources(self, expert_map):
+        self.cpu_ep_count = sum(1 for x in expert_map.values() if x == self.RANK_CPU)
+        self.cpu_moe = None
+        self.cpu_stream = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_scaling_factor: Optional[float] = None,
+        shared_experts_functor: Optional[Callable] = None,
+    ):
+        shared_outputs = None
+        gpu_result = None
+
+        if self.cpu_moe:
+            cpu_result = self.cpu_moe.forward_start(hidden_states, router_logits)
+        if self.num_experts_per_partition > 0:
+            gpu_result = super().forward(hidden_states, router_logits)
+
+        if shared_experts_functor is not None:
+            shared_outputs = shared_experts_functor(hidden_states)
+        if self.cpu_moe:
+            cpu_result_on_gpu = self.cpu_moe.forward_sync(hidden_states, cpu_result)
+
+        if gpu_result is None:
+            if self.cpu_moe:
+                result = cpu_result_on_gpu
+            else:
+                result = torch.zeros_like(hidden_states)
+        else:
+            if self.cpu_moe:
+                result = gpu_result + cpu_result_on_gpu
+            else:
+                result = gpu_result
+
+        if routed_scaling_factor is not None:
+            result = result * routed_scaling_factor
+        if shared_outputs is not None:
+            result += shared_outputs
+        return result
+
+    def is_hosting_cpu(self):
+        return self.ep_rank == 0 and self.cpu_ep_count != 0
+
+    def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id):
+        if self.cpu_moe:
+            self.cpu_moe.weight_loader(
+                param, loaded_weight, weight_name, shard_id, expert_id
+            )
+
+        return super().weight_loader(
+            param, loaded_weight, weight_name, shard_id, expert_id
+        )
+
+    def create_default_expert_map(self, num_experts, tp_size, num_gpu_experts):
+        # half on CPU, other half set even on GPUs
+        ep_size = tp_size or get_tensor_model_parallel_world_size()
+        expert_map_plan = dict()
+        # gpu_expert_number = num_experts // 2
+        gpu_in_high_part = False
+        # if num_gpu_experts == 0:
+        #     gpu_expert_total = num_experts // 2
+        if num_gpu_experts < 0:
+            gpu_in_high_part = True
+            gpu_expert_total = -num_gpu_experts
+        else:
+            gpu_expert_total = num_gpu_experts
+        logger.debug(f"create_default_expert_map, gpu_expert_total:{gpu_expert_total}")
+        for e_id in range(num_experts):
+            if (
+                num_experts - 1 - e_id if gpu_in_high_part else e_id
+            ) < gpu_expert_total:
+                expert_map_plan[e_id] = e_id % ep_size
+            else:
+                expert_map_plan[e_id] = self.RANK_CPU
+        return expert_map_plan
+
+
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def create_weights(
@@ -836,6 +1414,218 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                 )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+            return
+
+        # If checkpoint is fp8, we need to handle that the
+        # MoE kernels require single activation scale and single weight
+        # scale for w13 per expert.
+        else:
+            if self.quant_config.activation_scheme == "static":
+                if layer.w13_input_scale is None or layer.w2_input_scale is None:
+                    raise ValueError(
+                        "QuantConfig has static quantization, but found "
+                        "activation scales are None."
+                    )
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    torch.max(layer.w13_weight_scale, dim=1).values,
+                    requires_grad=False,
+                )
+            return
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class Fp8EPMoEMethodCPUInfer(Fp8MoEMethod):
+    """MoE method for FP8 for CPU infer.
+    Supports loading FP8 checkpoints with static weight scale and
+    dynamic/static activation scale.
+    Difference to Fp8MoEMethod is to create tensor instead of parameters
+    as we are not able to release memory if data are stored in parameters
+    for unknown reason.
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        self.quant_config = quant_config
+        self.block_quant = self.quant_config.weight_block_size is not None
+
+    def create_weights(
+        self,
+        layer: Module,
+        num_experts_per_partition: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            params_dtype = torch.float8_e4m3fn
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if self.block_quant:
+            block_n, block_k = (
+                self.quant_config.weight_block_size[0],
+                self.quant_config.weight_block_size[1],
+            )
+            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+            # Required by collum parallel or enabling merged weights
+            if intermediate_size % block_n != 0:
+                raise ValueError(
+                    f"The output_size of gate's and up's weight = "
+                    f"{intermediate_size} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+            if tp_size > 1:
+                # Required by row parallel
+                if intermediate_size % block_k != 0:
+                    raise ValueError(
+                        f"The input_size of down's weight = "
+                        f"{intermediate_size} is not divisible by "
+                        f"weight quantization block_k = {block_k}."
+                    )
+
+        # WEIGHTS
+        w13_weight = torch.empty(
+            num_experts_per_partition,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=params_dtype,
+            device="cpu",
+        )
+        layer.w13_weight = w13_weight
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.empty(
+            num_experts_per_partition,
+            hidden_size,
+            intermediate_size,
+            dtype=params_dtype,
+            device="cpu",
+        )
+        layer.w2_weight = w2_weight
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # WEIGHT_SCALES
+        if self.block_quant:
+            w13_weight_scale = torch.ones(
+                num_experts_per_partition,
+                2 * ((intermediate_size + block_n - 1) // block_n),
+                (hidden_size + block_k - 1) // block_k,
+                dtype=torch.float32,
+            )
+            w2_weight_scale = torch.ones(
+                num_experts_per_partition,
+                (hidden_size + block_n - 1) // block_n,
+                (intermediate_size + block_k - 1) // block_k,
+                dtype=torch.float32,
+            )
+            layer.w13_weight_scale_inv = w13_weight_scale
+            layer.w2_weight_scale_inv = w2_weight_scale
+            assert self.quant_config.activation_scheme == "dynamic"
+        else:
+            # WEIGHT_SCALES
+            # Allocate 2 scales for w1 and w3 respectively.
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
+
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the weight scales are loaded in properly
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+            if self.block_quant
+            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
+        # If loading fp8 checkpoint, pass the weight loaders.
+        # If loading an fp16 checkpoint, do not (we will quantize in
+        #   process_weights_after_loading()
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # INPUT_SCALES
+        if self.quant_config.activation_scheme == "static":
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "Found static activation scheme for checkpoint that "
+                    "was not serialized fp8."
+                )
+
+            w13_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            w2_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+
+        # If checkpoint is fp16, quantize in place.
+        if not self.quant_config.is_checkpoint_fp8_serialized:
+            # If rocm, use float8_e4m3fnuz as dtype
+            fp8_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+
+            layer.w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    layer.num_experts_per_partition,
+                    dtype=torch.float32,
+                    device=w13_weight.device,
+                ),
+                requires_grad=False,
+            )
+
+            for expert in range(layer.num_experts_per_partition):
+                if _is_cuda:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
+                else:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
+            layer.w13_weight = w13_weight
+            layer.w2_weight = w2_weight
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -1256,5 +2046,8 @@ def get_moe_impl_class():
     if global_server_args_dict["enable_deepep_moe"]:
         return DeepEPMoE
     if global_server_args_dict["enable_ep_moe"]:
-        return EPMoE
+        if global_server_args_dict["enable_ep_moe_heto"]:
+            return EPMoEHeto
+        else:
+            return EPMoE
     return FusedMoE

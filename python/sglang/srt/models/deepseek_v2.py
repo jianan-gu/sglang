@@ -267,6 +267,16 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
+        additional_config = {}
+        if global_server_args_dict["enable_deepep_moe"]:
+            additional_config = dict(
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]]
+            )
+        elif global_server_args_dict["enable_ep_moe_heto"]:
+            additional_config = dict(
+                num_gpu_experts=global_server_args_dict["ep_moe_heto_gpu_experts"]
+            )
+
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -284,11 +294,7 @@ class DeepseekV2MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
-                else {}
-            ),
+            **additional_config,
         )
 
         self.shared_experts_is_int8 = False
@@ -379,16 +385,25 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states)
 
-        shared_output = self._forward_shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-        if not _is_cuda:
-            final_hidden_states *= self.routed_scaling_factor
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+        if global_server_args_dict["enable_ep_moe_heto"]:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_experts_functor=self._forward_shared_experts,
+            )
+        else:
+            shared_output = self._forward_shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+            if not _is_cuda:
+                final_hidden_states *= self.routed_scaling_factor
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
