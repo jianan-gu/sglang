@@ -219,6 +219,21 @@ inline __m512 CVT_INT8_TO_FP32(__m128i x) {
   return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(x));
 }
 
+
+inline void unpack_B(
+  at::Half* __restrict__ Btmp,
+  const at::quint4x2* __restrict__ packed_B,
+  const uint8_t* __restrict__ Bz,
+  const at::Half* __restrict__ Bs,
+  int64_t N,
+  int64_t K,
+  int group_size,
+  int64_t ldb,
+  int64_t ldb_tmp,
+  int64_t strideBz,
+  int64_t strideBs) {
+    TORCH_CHECK(false, "int4 unpack does not support fp16 yet.");
+  }
 inline void unpack_B(
   at::BFloat16* __restrict__ Btmp,
   const at::quint4x2* __restrict__ packed_B,
@@ -318,19 +333,8 @@ struct brgemm<at::BFloat16, has_bias> {
       int64_t strideBs) {
     constexpr int BLOCK_N = block_size_n();
     const int ldb_tmp = BLOCK_N;
-
-    for (int64_t k = 0; k < K; k += BLOCK_K) {
-      int64_t kb_size = std::min(static_cast<int64_t>(BLOCK_K), K - k);
-      const int64_t kgs = k / group_size;
-
-      unpack_B(Btmp, B + (k >> 1) * ldb, Bz + kgs * strideBz, Bs + kgs * strideBs,
-               N, kb_size, group_size, ldb, ldb_tmp, strideBz, strideBs);
-
-      const bool add_C = k != 0;
-      at::native::cpublas::brgemm(
-        M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
-    }
-
+    at::native::cpublas::brgemm(
+      M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
     // copy from Ctmp to C
     for (int64_t m = 0; m < M; ++m) {
       if constexpr (has_bias) {
@@ -418,36 +422,61 @@ void int4_w4a16_linear_kernel_impl(
 
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
-  // constexpr int64_t BLOCK_N = 64;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
   // TODO: find this threshold
   const bool use_brgemm = M > 4;
+  scalar_t* Btmp_start = nullptr;
+  if (use_brgemm) {
+    at::Tensor Btmp_t = at::empty(
+      {N, K}, c10::CppTypeToScalarType<scalar_t>::value);
+   Btmp_start = Btmp_t.data_ptr<scalar_t>();
+  at::parallel_for(0, NB, 0, [&](int64_t begin, int64_t end) {
+    int64_t nb{0};
+    data_index_init(begin,  nb, NB);
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+      auto Btmp = Btmp_start + nb_start*K;
+      for (int64_t k = 0; k < K; k += BLOCK_K) {
+        int64_t kb_size = std::min(static_cast<int64_t>(BLOCK_K), K - k);
+        const int64_t kgs = k / group_size;
+        auto strideBz = N;
+        auto strideBs = N;
+        auto ldb = nb_size;
+        auto Bz = w_zeros + nb_start;
+        auto Bs = w_scales + nb_start;
+        auto B = w + nb_start * K / 2;
+        unpack_B(Btmp + k*BLOCK_N, B + (k >> 1) * ldb, Bz + kgs * strideBz, Bs + kgs * strideBs,
+                 nb_size, kb_size, group_size, ldb, BLOCK_N, strideBz, strideBs);
 
-  // parallel on [MB, NB]
+      }
+      data_index_step( nb, NB);
+    }
+  });
+}
+
+  // l2 cache block for n
+  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
-      int64_t mb{0}, nb{0};
-      data_index_init(begin, mb, MB, nb, NB);
-
+    parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
+      // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
-      alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
-
-      for (int64_t i = begin; i < end; ++i) {
-        UNUSED(i);
+      for (int64_t nbb = begin_nb; nbb < end_nb; nbb += cache_blocks_nb) {
+      for (int64_t mb = begin_mb; mb < end_mb; ++mb) {
+      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
         int64_t mb_start = mb * BLOCK_M;
         int64_t mb_size = std::min(M - mb_start, BLOCK_M);
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(N - nb_start, BLOCK_N);
-
         tinygemm_kernel<scalar_t, has_bias>(
             /*   A  */ x + mb_start * mat1_strideM,
             /*   B  */ w + nb_start * K / 2,  // divide by 2 since w is u4 packed in u8
             /*   C  */ out + mb_start * out_strideM + nb_start,
             /*  Bz  */ w_zeros + nb_start,
             /*  Bs  */ w_scales + nb_start,
-            /* Btmp */ Btmp,
+            /* Btmp */ use_brgemm ? Btmp_start + nb_start*K : nullptr,
             /* Ctmp */ Ctmp,
             /* bias */ bias + nb_start,
             /*   M  */ mb_size,
@@ -460,11 +489,7 @@ void int4_w4a16_linear_kernel_impl(
             /* sBz  */ N,
             /* sBs  */ N,
             /* brg  */ use_brgemm);
-
-        // move to the next index
-        data_index_step(mb, MB, nb, NB);
-      }
-
+      }}}
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();
       }
