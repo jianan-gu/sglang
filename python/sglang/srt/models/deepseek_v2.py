@@ -268,7 +268,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
-        if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
+        if config.n_shared_experts is not None: # and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
             self.shared_experts = DeepseekV2MLP(
@@ -348,11 +348,11 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (
-            hasattr(self, "shared_experts")
-            and self.shared_experts.gate_up_proj.use_intel_amx_backend
-        ):
-            return self.forward_cpu(hidden_states)
+        #if (
+        #    hasattr(self, "shared_experts")
+        #    and self.shared_experts.gate_up_proj.use_intel_amx_backend
+        #):
+        #    return self.forward_cpu(hidden_states)
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -1042,13 +1042,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1),
-                zero_allocator.allocate(1),
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
+            #            breakpoint()
+
+            wkc_dq = self.w_kc.to(torch.float16) * self.w_scale
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), wkc_dq)
+            #q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+            #    q_nope.transpose(0, 1),
+            #    zero_allocator.allocate(1),
+            #)
+            #q_nope_out = bmm_fp8(
+            #    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+            #)
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -1094,17 +1098,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                attn_output.transpose(0, 1),
-                zero_allocator.allocate(1),
-            )
-            attn_bmm_output = bmm_fp8(
-                attn_output_val,
-                self.w_vc,
-                attn_output_scale,
-                self.w_scale,
-                torch.bfloat16,
-            )
+            wvc_dq = self.w_vc.to(torch.float16) * self.w_scale
+            attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), wvc_dq)
+
+            #attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+            #    attn_output.transpose(0, 1),
+            #    zero_allocator.allocate(1),
+            #)
+            #attn_bmm_output = bmm_fp8(
+            #    attn_output_val,
+            #    self.w_vc,
+            #    attn_output_scale,
+            #    self.w_scale,
+            #    torch.bfloat16,
+            #)
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)

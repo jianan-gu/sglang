@@ -1462,9 +1462,17 @@ def fused_experts_impl(
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
+                intermediate_cache1_tmp = intermediate_cache1.view(-1, N)
+                intermediate_cache1_tmp_half = intermediate_cache1_tmp[:,:N//2]
+                intermediate_cache1_tmp[:,:N//2] = torch.nn.functional.silu(intermediate_cache1_tmp_half)
+
+                intermediate_cache2[...] = intermediate_cache1_tmp[:,:N//2] * intermediate_cache1_tmp[:,N//2:]
+
+                #breakpoint()
+
+                #vllm_ops.silu_and_mul(
+                #    intermediate_cache2, intermediate_cache1.view(-1, N)
+                #)
         elif activation == "gelu":
             if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)

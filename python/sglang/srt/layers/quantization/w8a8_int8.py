@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import (
-    _process_weight_after_loading,
+#    _process_weight_after_loading,
     cpu_has_amx_support,
     is_cuda,
     set_weight_attrs,

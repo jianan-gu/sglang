@@ -29,7 +29,7 @@ if not is_hip():
     if use_vllm_custom_allreduce:
         custom_op = torch.ops._C_custom_ar
     else:
-        custom_op = sgl_kernel.allreduce
+        pass #custom_op = sgl_kernel.allreduce
 
     # custom allreduce
     def init_custom_ar(
