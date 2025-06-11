@@ -1,9 +1,16 @@
 #include "common.h"
 #include "vec.h"
 #include "gemm.h"
-
+#include "vec_struct.h"
 namespace {
-  #define QUANT_A_THRESHOLD 30720
+
+#define QUANT_A_THRESHOLD 30720
+#define ADDRESS(p, x, y, ld) ((p) + (x) * (ld) + (y))
+constexpr long LOOP_K_UNROLL = 4; // TODO(jgong5): do not hard-code
+constexpr int get_n_group_size(int N) {
+  return N == 16 ? 16 : (N == 32 ? 32 : 64);
+}
+#define ADDRESS(p, x, y, ld) ((p) + (x) * (ld) + (y))
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -434,6 +441,557 @@ inline at::Tensor quantize_per_tensor<at::BFloat16>(
 #endif
 }
 
+template <long N_GROUP_SIZE, bool sym_quant>
+struct load_dequant_zp_only_4bit {
+  template <typename LUT, typename VAT>
+  static inline VAT call(uint8_t* p, LUT lut, VAT vzps) {
+    TORCH_CHECK(false, "not implemented");
+  }
+};
+
+template <bool sym_quant>
+struct load_dequant_zp_only_4bit<64, sym_quant> {
+// TODO(jgong5): further simplify the dequant intrinsics below with VecOps
+#if defined(CPU_CAPABILITY_AVX512)
+  static inline std::array<__m512, 4> call(
+      uint8_t* p,
+      __m512 lut,
+      std::array<__m512, 4> vzps) {
+    using T = float;
+    using VA = VecArray<64, T>;
+    using VAT = typename VA::type;
+    constexpr long COLS = VA::num_vec;
+    auto packed = _mm256_loadu_si256((__m256i*)p);
+    __m512i int32[COLS];
+    {
+      auto low_4bit = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(packed));
+      auto high_4bit = _mm512_srli_epi32(low_4bit, 4);
+      int32[0] = low_4bit;
+      int32[2] = high_4bit;
+    }
+    {
+      auto low_4bit = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(packed, 1));
+      auto high_4bit = _mm512_srli_epi32(low_4bit, 4);
+      int32[1] = low_4bit;
+      int32[3] = high_4bit;
+    }
+    VAT vbs;
+    compile_time_for<COLS>::op([&](auto idx) {
+      vbs[idx] = _mm512_permutexvar_ps(int32[idx], lut);
+      if constexpr (!sym_quant) {
+        vbs[idx] = _mm512_sub_ps(vbs[idx], vzps[idx]);
+      }
+    });
+    return vbs;
+  }
+#endif
+
+#if defined(CPU_CAPABILITY_AVX512_FP16)
+  static inline std::array<__m512h, 2> call(
+      uint8_t* p,
+      __m512h lut,
+      std::array<__m512h, 2> vzps) {
+    using T = tpp::half;
+    using VA = VecArray<64, T>;
+    using VAT = typename VA::type;
+    constexpr long COLS = VA::num_vec;
+    auto packed = _mm256_loadu_si256((__m256i*)p);
+    __m512i int32[COLS];
+    {
+      auto low_4bit = _mm512_cvtepu8_epi16(packed);
+      auto high_4bit = _mm512_srli_epi16(low_4bit, 4);
+      int32[0] = low_4bit;
+      int32[1] = high_4bit;
+    }
+    VAT vbs;
+    compile_time_for<COLS>::op([&](auto idx) {
+      vbs[idx] = _mm512_permutexvar_ph(int32[idx], lut);
+      if constexpr (!sym_quant) {
+        vbs[idx] = _mm512_sub_ph(vbs[idx], vzps[idx]);
+      }
+    });
+    return vbs;
+  }
+#endif
+};
+
+template <bool sym_quant>
+struct load_dequant_zp_only_4bit<32, sym_quant> {
+#if defined(CPU_CAPABILITY_AVX512)
+  static inline std::array<__m512, 2> call(
+      uint8_t* p,
+      __m512 lut,
+      std::array<__m512, 2> vzps) {
+    using T = float;
+    using VA = VecArray<32, T>;
+    using VAT = typename VA::type;
+    constexpr long COLS = VA::num_vec;
+    auto packed = _mm_loadu_si128((__m128i*)p);
+    __m512i int32[COLS];
+    {
+      auto low_4bit = _mm512_cvtepu8_epi32(packed);
+      auto high_4bit = _mm512_srli_epi32(low_4bit, 4);
+      int32[0] = low_4bit;
+      int32[1] = high_4bit;
+    }
+    VAT vbs;
+    compile_time_for<COLS>::op([&](auto idx) {
+      vbs[idx] = _mm512_permutexvar_ps(int32[idx], lut);
+      if constexpr (!sym_quant) {
+        vbs[idx] = _mm512_sub_ps(vbs[idx], vzps[idx]);
+      }
+    });
+    return vbs;
+  }
+#endif
+
+#if defined(CPU_CAPABILITY_AVX512_FP16)
+  static inline std::array<__m512h, 1> call(
+      uint8_t* p,
+      __m512h lut,
+      std::array<__m512h, 1> vzps) {
+    using T = tpp::half;
+    using VA = VecArray<32, T>;
+    using VAT = typename VA::type;
+    constexpr long COLS = VA::num_vec;
+    auto packed = _mm_loadu_si128((__m128i*)p);
+    __m512i int32[COLS];
+    {
+      auto low_4bit = _mm256_cvtepu8_epi16(packed);
+      auto high_4bit = _mm256_srli_epi16(low_4bit, 4);
+      // combine low_4bit and high_4bit into __m512i
+      int32[0] =
+          _mm512_inserti64x4(_mm512_castsi256_si512(low_4bit), high_4bit, 1);
+    }
+    VAT vbs;
+    compile_time_for<COLS>::op([&](auto idx) {
+      vbs[idx] = _mm512_permutexvar_ph(int32[idx], lut);
+      if constexpr (!sym_quant) {
+        vbs[idx] = _mm512_sub_ph(vbs[idx], vzps[idx]);
+      }
+    });
+    return vbs;
+  }
+#endif
+};
+
+template <bool sym_quant>
+struct load_dequant_zp_only_4bit<16, sym_quant> {
+#if defined(CPU_CAPABILITY_AVX512)
+  static inline std::array<__m512, 1> call(
+      uint8_t* p,
+      __m512 lut,
+      std::array<__m512, 1> vzps) {
+    using T = float;
+    using VA = VecArray<16, T>;
+    using VAT = typename VA::type;
+    constexpr long COLS = VA::num_vec;
+    static_assert(COLS == 1, "COLS must be 1");
+    uint64_t packed = reinterpret_cast<uint64_t*>(p)[0];
+    uint64_t high = packed >> 4;
+    __m128i packed_128 = _mm_set_epi64x(high, packed);
+    __m512i int32 = _mm512_cvtepu8_epi32(packed_128);
+    VAT vbs;
+    vbs[0] = _mm512_permutexvar_ps(int32, lut);
+    if constexpr (!sym_quant) {
+      vbs[0] = _mm512_sub_ps(vbs[0], vzps[0]);
+    }
+    return vbs;
+  }
+#endif
+
+#if defined(CPU_CAPABILITY_AVX512_FP16)
+  static inline std::array<__m512h, 0> call(
+      uint8_t* p,
+      __m512h lut,
+      std::array<__m512h, 0> vzps) {
+    TORCH_CHECK(false, "not implemented");
+  }
+#endif
+};
+
+
+template <long N, bool sym_quant, typename T>
+struct load_dequant_4bit {
+  using VT = typename VecType<T>::type;
+  using V = VecOps<VT>;
+  using VA = VecArray<N, T>;
+  using VAT = typename VA::type;
+  constexpr static long COLS = VA::num_vec;
+
+  static inline VAT call(uint8_t* p, VAT vscales, VT lut, VAT vzps) {
+    auto vbs = load_dequant_zp_only_4bit<N, sym_quant>::call(p, lut, vzps);
+    compile_time_for<COLS>::op(
+        [&](auto idx) { vbs[idx] = V::mul(vbs[idx], vscales[idx]); });
+    return vbs;
+  }
+};
+
+template <
+    typename T,
+    typename Tout,
+    typename TScale,
+    typename TZero,
+    long M,
+    long N,
+    long ldb,
+    bool transA = false,
+    bool ACC = false,
+    int quant_a_mode = -1,
+    long PREFETCH_K_DIST = 0,
+    typename Enabled = void>
+struct GemmMicroKernel {
+  template <int qw_type, bool sym_quant_w>
+  static inline void call(
+      long K,
+      T* A,
+      long lda,
+      uint8_t* B,
+      Tout* C,
+      long ldc,
+      TScale* scales,
+      TZero* zps) {
+    TORCH_CHECK(false, "Not implemented");
+  }
+};
+
+template <
+    typename T,
+    long M,
+    long N,
+    long ldb,
+    bool transA,
+    bool ACC,
+    int quant_a_mode,
+    long PREFETCH_K_DIST>
+struct GemmMicroKernel<
+    T,
+    T,
+    T,
+    T,
+    M,
+    N,
+    ldb,
+    transA,
+    ACC,
+    quant_a_mode,
+    PREFETCH_K_DIST,
+    typename std::enable_if_t<
+        std::is_same<T, float>::value || std::is_same<T, at::Half>::value>> {
+  // TODO(jgong5): generalize this with pre/post op handlers
+  template <int qw_type, bool sym_quant_w>
+  static inline void call(
+      long K,
+      T* A,
+      long lda,
+      uint8_t* B,
+      T* C,
+      long ldc,
+      T* scales,
+      T* zps) {
+    static_assert(N % 16 == 0, "N must be a multiple of 16");
+    constexpr const int N_GROUP_SIZE = get_n_group_size(N);
+
+    using VT = typename VecType<T>::type;
+    using V = VecOps<VT>;
+    using ST = typename V::ST;
+    using VArray = VecArray<N_GROUP_SIZE, T>;
+    using VArrayT = typename VArray::type;
+
+    constexpr const int COLS = N / V::VLEN;
+    constexpr const int CBLOCK = N_GROUP_SIZE / V::VLEN;
+    constexpr const int CNBLOCKS = N / N_GROUP_SIZE;
+    VT va[M];
+    VArrayT vb[CNBLOCKS];
+    VT vc[M * COLS];
+    VArrayT vscales[CNBLOCKS];
+    VArrayT vzps[CNBLOCKS];
+
+    VT lut;
+    constexpr bool is_4bit_flag = true;
+    if constexpr (is_4bit_flag) {
+      if constexpr (sym_quant_w) {
+        lut = V::set_neg_8_to_7();
+      } else {
+        lut = V::set_0_to_15();
+      }
+    }
+
+    // Load scales and zps
+    compile_time_for<CNBLOCKS>::op([&](auto i) {
+      constexpr const int col = i * CBLOCK;
+      vscales[i] = VArray::load1d(scales + col * V::VLEN);
+      if constexpr (!sym_quant_w) {
+        vzps[i] = VArray::load1d(zps + col * V::VLEN);
+      }
+    });
+
+    // NB: For fp16 in int8 woq, we do not delay the scale to the post-op but
+    // leave it to the dequant otherwise the weight value might be too large to
+    // overflow fp16 range.
+    constexpr bool scale_as_post_op = !std::is_same<T, at::Half>() || is_4bit_flag;
+
+    compile_time_for<M * COLS>::op([&](auto i) { vc[i] = V::setzero(); });
+
+    auto compute = [&](auto i, int k) {
+      constexpr const int row = i / CNBLOCKS;
+      constexpr const int cbidx = i % CNBLOCKS;
+
+      if constexpr (cbidx == 0) {
+        if constexpr (transA) {
+          va[row] = V::set1(*(ST*)ADDRESS(A, k, row, lda));
+        } else {
+          va[row] = V::set1(*(ST*)ADDRESS(A, row, k, lda));
+        }
+      }
+
+      if constexpr (row == 0) {
+        constexpr const int col = cbidx * CBLOCK;
+        if constexpr (scale_as_post_op) {
+          if constexpr (is_4bit_flag) {
+            vb[cbidx] =
+                load_dequant_zp_only_4bit<N_GROUP_SIZE, sym_quant_w>::call(
+                    ADDRESS(B, k, col * V::VLEN / 2, ldb / 2),
+                    lut,
+                    vzps[cbidx]);
+          }
+        } else {
+          if constexpr (is_4bit_flag) {
+            vb[cbidx] = load_dequant_4bit<N_GROUP_SIZE, sym_quant_w, T>::call(
+                ADDRESS(B, k, col * V::VLEN / 2, ldb / 2),
+                vscales[cbidx],
+                lut,
+                vzps[cbidx]);
+          }
+        }
+        if constexpr (PREFETCH_K_DIST > 0) {
+          if constexpr (is_4bit_flag) {
+            _mm_prefetch(
+                ADDRESS(B, k + PREFETCH_K_DIST, col * V::VLEN / 2, ldb / 2),
+                _MM_HINT_T0);
+          } else {
+            _mm_prefetch(
+                ADDRESS(B, k + PREFETCH_K_DIST, col * V::VLEN, ldb),
+                _MM_HINT_T0);
+          }
+        }
+      }
+
+      compile_time_for<CBLOCK>::op([&](auto col) {
+        constexpr const int idx = INDEX(row, INDEX(cbidx, col, CBLOCK), COLS);
+        vc[idx] = V::fmadd(va[row], vb[cbidx][col], vc[idx]);
+      });
+    };
+
+    // Accumulate along k
+    constexpr const int unroll = LOOP_K_UNROLL;
+    int k = 0;
+    for (; k < K / unroll; k++) {
+      compile_time_for<unroll>::op([&](auto i) {
+        compile_time_for<M * CNBLOCKS>::op(compute, k * unroll + i);
+      });
+    }
+    k *= unroll;
+    for (; k < K; k++) {
+      compile_time_for<M * CNBLOCKS>::op(compute, k);
+    }
+
+    // Store to C
+    auto store = [&](auto i) {
+      constexpr const int row = i / COLS;
+      constexpr const int col = i % COLS;
+      if constexpr (ACC) {
+        auto vc_old = V::loadu(ADDRESS(C, row, col * V::VLEN, ldc));
+        if constexpr (scale_as_post_op) {
+          vc[i] = V::fmadd(vscales[col / CBLOCK][col % CBLOCK], vc[i], vc_old);
+        } else {
+          vc[i] = V::fmadd(V::set1(1.0f), vc[i], vc_old);
+        }
+      } else if constexpr (scale_as_post_op) {
+        vc[i] = V::mul(vscales[col / CBLOCK][col % CBLOCK], vc[i]);
+      }
+      V::storeu(ADDRESS(C, row, col * V::VLEN, ldc), vc[i]);
+    };
+
+    compile_time_for<M * COLS>::op(store);
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512_VNNI)
+template <
+    long M,
+    long N,
+    long ldb,
+    bool transA,
+    bool ACC,
+    int quant_a_mode,
+    long PREFETCH_K_DIST>
+struct GemmMicroKernel<
+    /*Tin*/ uint8_t,
+    /*Tout*/ float,
+    /*TScale*/ float,
+    /*TZero*/ int8_t,
+    M,
+    N,
+    ldb,
+    transA,
+    ACC,
+    quant_a_mode,
+    PREFETCH_K_DIST> {
+  template <int qw_type, bool sym_quant_w>
+  static inline void call(
+      long K,
+      uint8_t* A,
+      long lda,
+      uint8_t* B,
+      float* C,
+      long ldc,
+      float* scales,
+      int8_t* zps,
+      float* scale_a,
+      int32_t* zp_a,
+      int32_t k_groups) {
+    if constexpr (!sym_quant_w) {
+      TORCH_CHECK(zps, "Zero points must be given for asymmetric quantization");
+    }
+    auto pqB = GetVLAPtr<uint8_t>(B, {ldb, 2}); // [K/4,N,4] packed in 4-bit
+
+    static_assert(N % 16 == 0, "N must be a multiple of 16");
+    constexpr const int COLS = N / 16;
+
+    __m512i ones = _mm512_set1_epi8(1); // used for computing compensation
+    __m512i va;
+    __m512i vb[COLS];
+    __m512i vc[M * COLS];
+    __m512 vscales[COLS];
+    __m512i vzps[COLS];
+    __m512i vcompensate[COLS];
+
+    // Load scales and zps
+    compile_time_for<COLS>::op([&](auto i) {
+      vscales[i] = _mm512_loadu_ps(scales + i * 16);
+      if constexpr (qw_type == WOQ_DTYPE_NF4) {
+        const __m512 factor = _mm512_set1_ps(1.0f / 127.0f);
+        vscales[i] = _mm512_mul_ps(vscales[i], factor);
+      }
+      // TODO(jgong5): should we use 512 or two 256 here?
+      if constexpr (!sym_quant_w) {
+        vzps[i] = combine_m256i(load_zps_4vnni(zps + i * 16));
+      }
+      if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+        vcompensate[i] = _mm512_setzero_epi32();
+      }
+    });
+
+    compile_time_for<M * COLS>::op(
+        [&](auto i) { vc[i] = _mm512_setzero_epi32(); });
+
+    auto compute = [&](auto i, int k) {
+      constexpr const int row = i / COLS;
+      constexpr const int col = i % COLS;
+
+      if constexpr (col == 0) {
+        if constexpr (transA) {
+          va = _mm512_set1_epi32(*(int32_t*)ADDRESS(A, k, row, lda));
+        } else {
+          va = _mm512_set1_epi32(*(int32_t*)ADDRESS(A, row, k, lda));
+        }
+      }
+
+      if constexpr (row == 0) {
+        if constexpr (!sym_quant_w) {
+          vb[col] = combine_m256i(load_uint4_as_int8(pqB[k / 4][col * 16]));
+          vb[col] = _mm512_sub_epi8(vb[col], vzps[col]);
+        } else if constexpr (qw_type == WOQ_DTYPE_INT4) {
+          vb[col] = combine_m256i(load_sint4_as_int8(pqB[k / 4][col * 16]));
+        } else {
+          vb[col] = combine_m256i(load_nf4_as_int8(pqB[k / 4][col * 16]));
+        }
+        if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+          vcompensate[col] =
+              _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
+        }
+        if constexpr (PREFETCH_K_DIST > 0) {
+          _mm_prefetch(pqB[(k + PREFETCH_K_DIST) / 4][col * 16], _MM_HINT_T0);
+        }
+      }
+      if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+        vc[i] = _mm512_dpbusd_epi32(vc[i], va, vb[col]);
+      } else {
+        auto vsb = _mm512_sign_epi8(vb[col], va);
+        auto vabsa = _mm512_sign_epi8(va, va);
+        vc[i] = _mm512_dpbusds_epi32(vc[i], vabsa, vsb);
+      }
+    };
+
+    // Accumulate along k
+    constexpr const int unroll = LOOP_K_UNROLL;
+    int k = 0;
+    for (; k < K / 4 / unroll; k++) {
+      compile_time_for<unroll>::op([&](auto i) {
+        compile_time_for<M * COLS>::op(compute, 4 * (k * unroll + i));
+      });
+    }
+    k *= 4 * unroll;
+    for (; k < K; k += 4) {
+      compile_time_for<M * COLS>::op(compute, k);
+    }
+
+    // Store to C
+    auto store = [&](auto i) {
+      constexpr const int row = i / COLS;
+      constexpr const int col = i % COLS;
+      // compute (qC - compensate * zp_a) * scale_a * scale_b
+      // where compensate = sum(qB)
+      __m512 vc_float;
+      if constexpr (
+          quant_a_mode == QUANT_A_PER_TENSOR ||
+          quant_a_mode == QUANT_A_PER_K_BLOCK ||
+          quant_a_mode == QUANT_A_PER_TENSOR_SYM ||
+          quant_a_mode == QUANT_A_PER_K_BLOCK_SYM) {
+        if constexpr (
+            quant_a_mode == QUANT_A_PER_TENSOR ||
+            quant_a_mode == QUANT_A_PER_K_BLOCK) {
+          vc[i] = _mm512_sub_epi32(
+              vc[i],
+              _mm512_mullo_epi32(vcompensate[col], _mm512_set1_epi32(*zp_a)));
+        }
+        vc_float = _mm512_cvtepi32_ps(vc[i]);
+        vc_float = _mm512_mul_ps(vc_float, _mm512_set1_ps(*scale_a));
+      } else if constexpr (
+          quant_a_mode == QUANT_A_PER_M || quant_a_mode == QUANT_A_PER_M_SYM) {
+        if constexpr (quant_a_mode == QUANT_A_PER_M) {
+          vc[i] = _mm512_sub_epi32(
+              vc[i],
+              _mm512_mullo_epi32(
+                  vcompensate[col], _mm512_set1_epi32(*(zp_a + row))));
+        }
+        vc_float = _mm512_cvtepi32_ps(vc[i]);
+        vc_float = _mm512_mul_ps(vc_float, _mm512_set1_ps(*(scale_a + row)));
+      } else {
+        if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+          vc[i] = _mm512_sub_epi32(
+              vc[i],
+              _mm512_mullo_epi32(
+                  vcompensate[col],
+                  _mm512_set1_epi32(*(zp_a + row * k_groups))));
+        }
+        vc_float = _mm512_cvtepi32_ps(vc[i]);
+        vc_float = _mm512_mul_ps(
+            vc_float, _mm512_set1_ps(*(scale_a + row * k_groups)));
+      }
+
+      vc_float = _mm512_mul_ps(vc_float, vscales[col]);
+      if constexpr (ACC) {
+        auto vc_old = _mm512_loadu_ps(C + row * ldc + col * 16);
+        vc_float = _mm512_add_ps(vc_float, vc_old);
+      }
+      _mm512_storeu_ps(C + row * ldc + col * 16, vc_float);
+    };
+    compile_time_for<M * COLS>::op(store);
+  }
+};
+#endif
 
 template <long ldb, int qw_type, bool sym_quant_w>
 struct Dequantize<
@@ -1006,14 +1564,14 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
 // bias     : [N]
 // out      : [M, N]
 //
-at::Tensor int4_w4a16_linear(
+at::Tensor int4_w4w8_linear(
     at::Tensor& x,
     at::Tensor& w,
     at::Tensor& w_zeros,
     at::Tensor& w_scales,
     std::optional<at::Tensor>& bias) {
   RECORD_FUNCTION(
-    "sgl-kernel::int4_w4a16_linear", std::vector<c10::IValue>({x, w, w_zeros, w_scales, bias}));
+    "sgl-kernel::int4_w4w8_linear", std::vector<c10::IValue>({x, w, w_zeros, w_scales, bias}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(x);
   CHECK_INPUT(w);
