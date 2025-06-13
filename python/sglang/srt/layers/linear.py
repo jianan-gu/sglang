@@ -38,10 +38,14 @@ from sglang.srt.utils import (
     narrow_padded_param_and_loaded_weight,
     reset_param_data_if_needed,
     set_weight_attrs,
+    narrow_padded_param_and_loaded_weight,
+    set_weight_attrs,
+    use_cpu,
 )
 from sglang.srt.utils import narrow_padded_param_and_loaded_weight, set_weight_attrs
-
 logger = logging.getLogger(__name__)
+
+_use_cpu = use_cpu()
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -426,9 +430,7 @@ class ColumnParallelLinear(LinearBase):
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
 
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-            if global_server_args_dict["device"] == "cpu":
+            if _use_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -660,9 +662,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
 
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-            if global_server_args_dict["device"] == "cpu":
+            if _use_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1144,9 +1144,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-            if global_server_args_dict["device"] == "cpu":
+            if _use_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1305,9 +1303,7 @@ class RowParallelLinear(LinearBase):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
 
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-            if global_server_args_dict["device"] == "cpu":
+            if _use_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
