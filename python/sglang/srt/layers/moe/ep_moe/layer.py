@@ -814,7 +814,7 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             num_expert_group,
             topk_group,
         )
-        self.cpu_moe = None
+        self.cpu_moe_engine = None
         self.dummy_correction_bias = torch.nn.Parameter(
             torch.zeros_like(self.correction_bias.data, device=self.device),
             requires_grad=False,
@@ -823,6 +823,8 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         self.cpu_sorted_topk_ids = None
         self.cpu_sorted_topk_weights = None
         self.cpu_result = None
+        self.cpu_tensor_tbo_subbatch_id = 0
+        self.tensor_tbo_pool_size = 2
         self.cached_tensors_size = 160  # TODO: magic number
         self.create_cpu_tensors_if_needed_from_params(
             hidden_size, top_k, torch.bfloat16, self.cached_tensors_size
@@ -854,10 +856,10 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         super().weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 
     def _create_cpu_moe_engine(self):
-        self.cpu_moe = self.cpu_engine.moe.MOE(
+        self.cpu_moe_engine = self.cpu_engine.moe.MOE(
             self.cpu_engine.moe.MOEConfig(*self.moe_config)
         )
-        self.cpu_moe.set_weights(
+        self.cpu_moe_engine.set_weights(
             self.w13_weight.data.data_ptr(),
             self.w2_weight.data.data_ptr(),
             self.w13_weight_scale_inv.data.data_ptr(),
@@ -889,10 +891,10 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         return sorted_topk_weights, sorted_topk_ids
 
     def forward_start(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if self.cpu_moe is None:
-            torch.cuda.current_stream().synchronize()
-            self._create_cpu_moe_engine()
+        self.forward_prepare(hidden_states, router_logits)
+        return self.forward_enqueue(hidden_states)
 
+    def forward_prepare(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         topk_weights, topk_ids = self.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -914,10 +916,42 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             or n_tokens <= self.cached_tensors_size
         ):
             assert n_tokens <= self.cached_tensors_size
+            # we are switching to next set, so prepare and enqueue must be togather
+            # there cannot be other prepare or enqueue in between
+            # please make sure check operation strategies won't break this assumption
+            self._switch_to_next_tensor_set()
             self.fill_cpu_tensors(hidden_states, sorted_topk_ids, sorted_topk_weights)
+        else:
+            # these are safe as only decode will run bto heto
+            self.adhoc_cpu_result = torch.zeros_like(
+                hidden_states, device=self.device, pin_memory=True
+            )
+            self.adhoc_gpu_result = torch.zeros_like(
+                hidden_states, device=hidden_states.device
+            )
+            self.adhoc_hidden_states_cpu = hidden_states.to(
+                self.device, non_blocking=True
+            )
+            self.adhoc_sorted_topk_ids_cpu = sorted_topk_ids.to(torch.int).to(
+                self.device, non_blocking=True
+            )
+            self.adhoc_sorted_topk_weights_cpu = sorted_topk_weights.to(
+                self.device, non_blocking=True
+            )
+
+    def forward_enqueue(self, hidden_states: torch.Tensor):
+        if self.cpu_moe_engine is None:
+            torch.cuda.current_stream().synchronize()
+            self._create_cpu_moe_engine()
+
+        n_tokens = hidden_states.shape[0]
+        if (
+            torch.cuda.is_current_stream_capturing()
+            or n_tokens <= self.cached_tensors_size
+        ):
             self.cpu_infer.submit_with_cuda_stream(
                 torch.cuda.current_stream(hidden_states.device).cuda_stream,
-                self.cpu_moe.forward_experts(
+                self.cpu_moe_engine.forward_experts(
                     self.cpu_hidden_states.data_ptr(),
                     self.cpu_sorted_topk_ids.data_ptr(),
                     self.cpu_sorted_topk_weights.data_ptr(),
@@ -927,22 +961,9 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             )
             return self.cpu_result[:n_tokens]
         else:
-            n_tokens = hidden_states.shape[0]
-            self.adhoc_cpu_result = torch.zeros_like(
-                hidden_states, device=self.device, pin_memory=True
-            )
-            self.adhoc_gpu_result = torch.zeros_like(
-                hidden_states, device=hidden_states.device
-            )
-            self.adhoc_hidden_states_cpu = hidden_states.to(self.device)
-            self.adhoc_sorted_topk_ids_cpu = sorted_topk_ids.to(torch.int).to(
-                self.device
-            )
-            self.adhoc_sorted_topk_weights_cpu = sorted_topk_weights.to(self.device)
-
             self.cpu_infer.submit_with_cuda_stream(
                 torch.cuda.current_stream(hidden_states.device).cuda_stream,
-                self.cpu_moe.forward_experts(
+                self.cpu_moe_engine.forward_experts(
                     self.adhoc_hidden_states_cpu.data_ptr(),
                     self.adhoc_sorted_topk_ids_cpu.data_ptr(),
                     self.adhoc_sorted_topk_weights_cpu.data_ptr(),
@@ -958,7 +979,7 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             self.cpu_infer.sync_with_cuda_stream(
                 torch.cuda.current_stream(hidden_states.device).cuda_stream
             )
-            return self.gpu_result[:bs].copy_(self.cpu_result[:bs], non_blocking=True)
+            return cpu_result.to(hidden_states.device, non_blocking=True)
         else:
             self.cpu_infer.sync_with_cuda_stream(
                 torch.cuda.current_stream(hidden_states.device).cuda_stream
@@ -972,33 +993,47 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         self, hidden_size, topk, dtype, batchsize
     ):
         if self.cpu_hidden_states is None:
-            self.cpu_hidden_states = torch.empty(
+            self.cpu_hidden_states_pool = [torch.empty(
                 (batchsize, hidden_size),
                 dtype=dtype,
                 device=self.device,
                 pin_memory=True,
-            )
-            self.cpu_sorted_topk_ids = torch.empty(
+            ) for _ in range(self.tensor_tbo_pool_size)]
+            self.cpu_sorted_topk_ids_pool = [torch.empty(
                 (batchsize, topk),
                 dtype=torch.int32,
                 device=self.device,
                 pin_memory=True,
-            )
-            self.cpu_sorted_topk_weights = torch.empty(
+            ) for _ in range(self.tensor_tbo_pool_size)]
+            self.cpu_sorted_topk_weights_pool = [torch.empty(
                 (batchsize, topk),
                 dtype=torch.float32,
                 device=self.device,
                 pin_memory=True,
-            )
-            self.cpu_result = torch.empty(
+            ) for _ in range(self.tensor_tbo_pool_size)]
+            self.cpu_result_pool = [torch.empty(
                 (batchsize, hidden_size),
                 dtype=dtype,
                 device=self.device,
                 pin_memory=True,
-            )
-            self.gpu_result = torch.empty(
-                (batchsize, hidden_size), dtype=dtype, device="cuda"
-            )
+            ) for _ in range(self.tensor_tbo_pool_size)]
+            self._switch_to_next_tensor_set()
+    
+    def _switch_to_next_tensor_set(self):
+        self.cpu_hidden_states = self.cpu_hidden_states_pool[
+            self.cpu_tensor_tbo_subbatch_id
+        ]
+        self.cpu_sorted_topk_ids = self.cpu_sorted_topk_ids_pool[
+            self.cpu_tensor_tbo_subbatch_id
+        ]
+        self.cpu_sorted_topk_weights = self.cpu_sorted_topk_weights_pool[
+            self.cpu_tensor_tbo_subbatch_id
+        ]
+        self.cpu_result = self.cpu_result_pool[self.cpu_tensor_tbo_subbatch_id]
+        self.cpu_tensor_tbo_subbatch_id = (
+            (self.cpu_tensor_tbo_subbatch_id + 1)
+            % self.tensor_tbo_pool_size
+        )
 
     def fill_cpu_tensors(self, hidden_states, sorted_topk_ids, sorted_topk_weights):
         bs = hidden_states.shape[0]
@@ -1094,19 +1129,49 @@ class EPMoEHeto(EPMoESparse):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-        routed_scaling_factor: Optional[float] = None,
-        shared_experts_functor: Optional[Callable] = None,
+        op_shared_experts: Optional[Callable] = None,
     ):
-        shared_outputs = None
-        gpu_result = None
+        self.forward_routed_experts_prepare(hidden_states, router_logits)
+        cpu_result, gpu_result = self.forward_routed_experts_enqueue(
+            hidden_states, router_logits
+        )
+        if op_shared_experts is not None:
+            shared_output = op_shared_experts(hidden_states)
+        result = self.forward_routed_experts_sync(
+            hidden_states,
+            gpu_result,
+            cpu_result,
+        )
+        return result, shared_output
+
+    def forward_routed_experts_prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ):
+        if self.cpu_moe:
+            self.cpu_moe.forward_prepare(hidden_states, router_logits)
+
+    def forward_routed_experts_enqueue(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ):
+        cpu_result, gpu_result = None, None
 
         if self.cpu_moe:
-            cpu_result = self.cpu_moe.forward_start(hidden_states, router_logits)
+            cpu_result = self.cpu_moe.forward_enqueue(hidden_states)
         if self.num_experts_per_partition > 0:
             gpu_result = super().forward(hidden_states, router_logits)
 
-        if shared_experts_functor is not None:
-            shared_outputs = shared_experts_functor(hidden_states)
+        return cpu_result, gpu_result
+
+    def forward_routed_experts_sync(
+        self,
+        hidden_states,
+        gpu_result,
+        cpu_result,
+    ):
         if self.cpu_moe:
             cpu_result_on_gpu = self.cpu_moe.forward_sync(hidden_states, cpu_result)
 
@@ -1121,10 +1186,6 @@ class EPMoEHeto(EPMoESparse):
             else:
                 result = gpu_result
 
-        if routed_scaling_factor is not None:
-            result = result * routed_scaling_factor
-        if shared_outputs is not None:
-            result += shared_outputs
         return result
 
     def is_hosting_cpu(self):

@@ -193,6 +193,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    two_batch_overlap_mode: Optional[Literal["deepep", "heto"]] = "deepep"
     enable_ep_moe_heto: bool = False
     ep_moe_heto_gpu_experts: int = 1
     enable_torch_compile: bool = False
@@ -1349,6 +1350,13 @@ class ServerArgs:
             action="store_true",
             help="Enabling two micro batches to overlap.",
         )
+        parser.add_argument(
+            "--two-batch-overlap-mode",
+            type=str,
+            default=ServerArgs.two_batch_overlap_mode,
+            help="The model for two batch overlap, deepep mode will interleave compute and communicate in deepep implementation, heto mode will interleave CPU and GPU operations for heto pipe implementation.",
+        )
+
         parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
