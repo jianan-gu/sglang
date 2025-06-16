@@ -1,6 +1,6 @@
 from dataclasses import dataclass
-from typing import List, Optional
 from enum import IntEnum, auto
+from typing import List, Optional
 
 import torch
 

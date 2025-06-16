@@ -1,9 +1,9 @@
+import gc
 import logging
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import Module
-import gc
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
@@ -829,6 +829,20 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         self.create_cpu_tensors_if_needed_from_params(
             hidden_size, top_k, torch.bfloat16, self.cached_tensors_size
         )
+        self._create_expected_weights_set()
+
+    def _create_expected_weights_set(self):
+        # create a set of weights names to be loaded,
+        # so we can check if all weights are loaded
+        # after all weights are loaded, we will set weights to CPU
+        # so to avoid over occupying memory in one numa node
+        self.expected_weights_set = set()
+        for expert_id in range(len(self.expert_id_to_local)):
+            if self.expert_id_to_local[expert_id] == -1:
+                continue
+            for shard_id in ["w1", "w2", "w3"]:
+                self.expected_weights_set.add((expert_id, shard_id, "weight"))
+                self.expected_weights_set.add((expert_id, shard_id, "weight_scale_inv"))
 
     def weight_loader(
         self,
@@ -854,24 +868,46 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             raise ValueError(f"Unknown weight: {weight_name}")
 
         super().weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
+        weight_key = (
+            expert_id,
+            shard_id,
+            "weight_scale_inv" if "scale_inv" in weight_name else "weight",
+        )
+        if weight_key in self.expected_weights_set:
+            self.expected_weights_set.remove(weight_key)
+            if len(self.expected_weights_set) == 0:
+                # all weights are loaded, so we can set weights to CPU
+                self._create_cpu_moe_engine()
+
+        else:
+            logger.error(
+                f"Unexpected weight loaded: {weight_name}, "
+                f"shard_id: {shard_id}, expert_id: {expert_id}"
+            )
 
     def _create_cpu_moe_engine(self):
-        self.cpu_moe_engine = self.cpu_engine.moe.MOE(
-            self.cpu_engine.moe.MOEConfig(*self.moe_config)
-        )
-        self.cpu_moe_engine.set_weights(
-            self.w13_weight.data.data_ptr(),
-            self.w2_weight.data.data_ptr(),
-            self.w13_weight_scale_inv.data.data_ptr(),
-            self.w2_weight_scale_inv.data.data_ptr(),
-            self.dummy_correction_bias.data.data_ptr(),
-        )
-        del self.w13_weight
-        del self.w2_weight
-        del self.w13_weight_scale_inv
-        del self.w2_weight_scale_inv
-        del self.dummy_correction_bias
-        gc.collect()
+        if self.cpu_moe_engine is not None:
+            raise RuntimeError(
+                "CPU MoE engine already created, this should not happen."
+            )
+        else:
+            logger.info(f"Creating CPU MoE engine for layer {self.layer_id}")
+            self.cpu_moe_engine = self.cpu_engine.moe.MOE(
+                self.cpu_engine.moe.MOEConfig(*self.moe_config)
+            )
+            self.cpu_moe_engine.set_weights(
+                self.w13_weight.data.data_ptr(),
+                self.w2_weight.data.data_ptr(),
+                self.w13_weight_scale_inv.data.data_ptr(),
+                self.w2_weight_scale_inv.data.data_ptr(),
+                self.dummy_correction_bias.data.data_ptr(),
+            )
+            del self.w13_weight
+            del self.w2_weight
+            del self.w13_weight_scale_inv
+            del self.w2_weight_scale_inv
+            del self.dummy_correction_bias
+            gc.collect()
 
     def _sort_topk_ids(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
         # Get the sort indices (descending order)
@@ -916,7 +952,7 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             or n_tokens <= self.cached_tensors_size
         ):
             assert n_tokens <= self.cached_tensors_size
-            # we are switching to next set, so prepare and enqueue must be togather
+            # we are switching to next set, so prepare and enqueue must be together
             # there cannot be other prepare or enqueue in between
             # please make sure check operation strategies won't break this assumption
             self._switch_to_next_tensor_set()
@@ -993,32 +1029,44 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         self, hidden_size, topk, dtype, batchsize
     ):
         if self.cpu_hidden_states is None:
-            self.cpu_hidden_states_pool = [torch.empty(
-                (batchsize, hidden_size),
-                dtype=dtype,
-                device=self.device,
-                pin_memory=True,
-            ) for _ in range(self.tensor_tbo_pool_size)]
-            self.cpu_sorted_topk_ids_pool = [torch.empty(
-                (batchsize, topk),
-                dtype=torch.int32,
-                device=self.device,
-                pin_memory=True,
-            ) for _ in range(self.tensor_tbo_pool_size)]
-            self.cpu_sorted_topk_weights_pool = [torch.empty(
-                (batchsize, topk),
-                dtype=torch.float32,
-                device=self.device,
-                pin_memory=True,
-            ) for _ in range(self.tensor_tbo_pool_size)]
-            self.cpu_result_pool = [torch.empty(
-                (batchsize, hidden_size),
-                dtype=dtype,
-                device=self.device,
-                pin_memory=True,
-            ) for _ in range(self.tensor_tbo_pool_size)]
+            self.cpu_hidden_states_pool = [
+                torch.empty(
+                    (batchsize, hidden_size),
+                    dtype=dtype,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self.cpu_sorted_topk_ids_pool = [
+                torch.empty(
+                    (batchsize, topk),
+                    dtype=torch.int32,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self.cpu_sorted_topk_weights_pool = [
+                torch.empty(
+                    (batchsize, topk),
+                    dtype=torch.float32,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self.cpu_result_pool = [
+                torch.empty(
+                    (batchsize, hidden_size),
+                    dtype=dtype,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
             self._switch_to_next_tensor_set()
-    
+
     def _switch_to_next_tensor_set(self):
         self.cpu_hidden_states = self.cpu_hidden_states_pool[
             self.cpu_tensor_tbo_subbatch_id
@@ -1031,9 +1079,8 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
         ]
         self.cpu_result = self.cpu_result_pool[self.cpu_tensor_tbo_subbatch_id]
         self.cpu_tensor_tbo_subbatch_id = (
-            (self.cpu_tensor_tbo_subbatch_id + 1)
-            % self.tensor_tbo_pool_size
-        )
+            self.cpu_tensor_tbo_subbatch_id + 1
+        ) % self.tensor_tbo_pool_size
 
     def fill_cpu_tensors(self, hidden_states, sorted_topk_ids, sorted_topk_weights):
         bs = hidden_states.shape[0]
@@ -1544,7 +1591,7 @@ class Fp8EPMoEMethodCPUInfer(Fp8MoEMethod):
                 self.quant_config.weight_block_size[1],
             )
             # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-            # Required by collum parallel or enabling merged weights
+            # Required by column parallel or enabling merged weights
             if intermediate_size % block_n != 0:
                 raise ValueError(
                     f"The output_size of gate's and up's weight = "

@@ -58,7 +58,7 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
         )
 
-        if bs>1:
+        if bs > 1:
             self._init_forward_metadata_cuda_graph_children(
                 fn_name="init_forward_metadata_capture_cuda_graph",
                 bs=bs,
