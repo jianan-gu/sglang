@@ -201,6 +201,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 loaded_weight = loaded_weight.narrow(
                     self.output_dim, start_idx, shard_size
                 )
+            actual_shard_size = shard_size
         else:
             actual_shard_size = get_actual_shard_size(
                 shard_size, start_idx, loaded_weight.size(self.output_dim)
@@ -223,7 +224,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             # param_data = param_data.narrow(self.output_dim, 0, actual_shard_size)
         # print(shard_offset)
         # print(shard_size)
-        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+        param_data = param_data.narrow(self.output_dim, shard_offset, actual_shard_size)
         # if not use_presharded_weights:
         #     loaded_weight = loaded_weight.narrow(
         #         self.output_dim, shard_id * shard_size, shard_size
