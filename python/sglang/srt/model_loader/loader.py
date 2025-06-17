@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+enable_cpu_moe_in_xpu = bool(int(os.getenv("ENABLE_CPU_MOE_IN_XPU", "0")))
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -380,8 +381,12 @@ class DefaultModelLoader(BaseModelLoader):
                 # to be on the global target device. This scope is for the
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+                if enable_cpu_moe_in_xpu and type(quant_method).__name__ == 'Fp8MoEMethod':
+                    with device_loading_context(module, torch.device("cpu")):
+                        quant_method.process_weights_after_loading(module)
+                else:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -490,7 +495,11 @@ class DummyModelLoader(BaseModelLoader):
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
-            initialize_dummy_weights(model)
+            # initialize_dummy_weights(model)
+
+            import os
+            current_pid = os.getpid()
+            initialize_dummy_weights(model, low = -1e-1, high = 1e-1, seed=current_pid)
 
             # Model weight loading consists of two stages:
             # 1. Initial weight loading.
