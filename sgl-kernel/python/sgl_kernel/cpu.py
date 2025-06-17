@@ -210,7 +210,7 @@ def decode_attention(
     logit_cap=0.0,
 ):
     sgl_kernel.common_ops.decode_attention_cpu(
-        q,
+        q.contiguous(),
         k_buffer,
         v_buffer,
         o,
