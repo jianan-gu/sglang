@@ -879,12 +879,6 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
                 # all weights are loaded, so we can set weights to CPU
                 self._create_cpu_moe_engine()
 
-        else:
-            logger.error(
-                f"Unexpected weight loaded: {weight_name}, "
-                f"shard_id: {shard_id}, expert_id: {expert_id}"
-            )
-
     def _create_cpu_moe_engine(self):
         if self.cpu_moe_engine is not None:
             raise RuntimeError(
@@ -1009,16 +1003,16 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             )
             return self.adhoc_cpu_result
 
-    def forward_sync(self, hidden_states, cpu_result):
-        bs = hidden_states.shape[0]
+    def forward_sync(self, hidden_states_shape, hidden_states_device, cpu_result):
+        bs = hidden_states_shape[0]
         if torch.cuda.is_current_stream_capturing() or bs <= self.cached_tensors_size:
             self.cpu_infer.sync_with_cuda_stream(
-                torch.cuda.current_stream(hidden_states.device).cuda_stream
+                torch.cuda.current_stream(hidden_states_device).cuda_stream
             )
-            return cpu_result.to(hidden_states.device, non_blocking=True)
+            return cpu_result.to(hidden_states_device, non_blocking=True)
         else:
             self.cpu_infer.sync_with_cuda_stream(
-                torch.cuda.current_stream(hidden_states.device).cuda_stream
+                torch.cuda.current_stream(hidden_states_device).cuda_stream
             )
             return self.adhoc_gpu_result.copy_(cpu_result, non_blocking=True)
 
@@ -1084,6 +1078,12 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
 
     def fill_cpu_tensors(self, hidden_states, sorted_topk_ids, sorted_topk_weights):
         bs = hidden_states.shape[0]
+        # TODO: cpu_moe_engine will crash if all topk_ids are -1
+        # below is a hack to prevent that, but we should fix it in cpu_moe_engine
+        # sorted_topk_ids[:, 0] = torch.max(
+        #     sorted_topk_ids[:, 0],
+        #     torch.zeros_like(sorted_topk_ids[:, 0]),
+        # )
         assert bs <= self.cpu_hidden_states.shape[0]
         self.cpu_hidden_states[:bs].copy_(hidden_states, non_blocking=True)
         self.cpu_sorted_topk_ids[:bs].copy_(sorted_topk_ids, non_blocking=True)
@@ -1178,14 +1178,22 @@ class EPMoEHeto(EPMoESparse):
         router_logits: torch.Tensor,
         op_shared_experts: Optional[Callable] = None,
     ):
+        # hidden_states will be destroyed in the process, so we need to save its properties
+        # for later use
+        hidden_states_shape = hidden_states.shape
+        hidden_states_device = hidden_states.device
+        hidden_states_dtype = hidden_states.dtype
         self.forward_routed_experts_prepare(hidden_states, router_logits)
-        cpu_result, gpu_result = self.forward_routed_experts_enqueue(
-            hidden_states, router_logits
-        )
+        cpu_result = self.forward_routed_experts_enqueue(hidden_states, router_logits)
         if op_shared_experts is not None:
             shared_output = op_shared_experts(hidden_states)
+        gpu_result = self.forward_routed_experts_maybe_gpu(
+            hidden_states, router_logits  # here hidden_states will be destroyed
+        )
         result = self.forward_routed_experts_sync(
-            hidden_states,
+            hidden_states_shape,
+            hidden_states_device,
+            hidden_states_dtype,
             gpu_result,
             cpu_result,
         )
@@ -1204,29 +1212,41 @@ class EPMoEHeto(EPMoESparse):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ):
-        cpu_result, gpu_result = None, None
-
         if self.cpu_moe:
-            cpu_result = self.cpu_moe.forward_enqueue(hidden_states)
-        if self.num_experts_per_partition > 0:
-            gpu_result = super().forward(hidden_states, router_logits)
+            return self.cpu_moe.forward_enqueue(hidden_states)
+        return None
 
-        return cpu_result, gpu_result
+    def forward_routed_experts_maybe_gpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ):
+        if self.num_experts_per_partition > 0:
+            return super().forward(hidden_states, router_logits)
+        return None
 
     def forward_routed_experts_sync(
         self,
-        hidden_states,
+        hidden_states_shape,
+        hidden_states_device,
+        hidden_states_dtype,
         gpu_result,
         cpu_result,
     ):
         if self.cpu_moe:
-            cpu_result_on_gpu = self.cpu_moe.forward_sync(hidden_states, cpu_result)
+            cpu_result_on_gpu = self.cpu_moe.forward_sync(
+                hidden_states_shape, hidden_states_device, cpu_result
+            )
 
         if gpu_result is None:
             if self.cpu_moe:
                 result = cpu_result_on_gpu
             else:
-                result = torch.zeros_like(hidden_states)
+                result = torch.zeros(
+                    hidden_states_shape,
+                    dtype=hidden_states_dtype,
+                    device=hidden_states_device,
+                )
         else:
             if self.cpu_moe:
                 result = gpu_result + cpu_result_on_gpu

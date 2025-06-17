@@ -567,32 +567,49 @@ class DeepseekV2MoE(nn.Module):
         if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
+            state.hidden_states_shape = state.hidden_states_mlp_input.shape
+            state.hidden_states_device = state.hidden_states_mlp_input.device
+            state.hidden_states_dtype = state.hidden_states_mlp_input.dtype
             self.experts.forward_routed_experts_prepare(
                 hidden_states=state.hidden_states_mlp_input,
                 router_logits=state.router_logits,
             )
 
     def op_enqueue_experts(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.cpu_experts_result = self.experts.forward_routed_experts_enqueue(
+                hidden_states=state.hidden_states_mlp_input,
+                router_logits=state.router_logits,
+            )
+        else:
+            state.cpu_experts_result = None
+
+    def op_enqueue_experts_maybe_gpu(self, state):
         router_logits = state.pop("router_logits")
         if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
-            results = self.experts.forward_routed_experts_enqueue(
+            state.gpu_experts_result = self.experts.forward_routed_experts_maybe_gpu(
                 hidden_states=state.hidden_states_mlp_input,
                 router_logits=router_logits,
             )
-            state.cpu_experts_result, state.gpu_experts_result = results
         else:
-            state.cpu_experts_result = None
             state.gpu_experts_result = None
 
     def op_sync_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
-        ):
+        hidden_states_shape = state.pop("hidden_states_shape")
+        hidden_states_device = state.pop("hidden_states_device")
+        hidden_states_dtype = state.pop("hidden_states_dtype")
+        state.pop("hidden_states_mlp_input")
+        if (
+            state.forward_batch.forward_mode is not None
+        ) and not state.forward_batch.forward_mode.is_idle():
             combined = self.experts.forward_routed_experts_sync(
-                hidden_states=hidden_states_mlp_input,
+                hidden_states_shape=hidden_states_shape,
+                hidden_states_device=hidden_states_device,
+                hidden_states_dtype=hidden_states_dtype,
                 gpu_result=state.pop("gpu_experts_result"),
                 cpu_result=state.pop("cpu_experts_result"),
             )

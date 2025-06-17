@@ -269,6 +269,7 @@ def _compute_moe_deepseek_decode_heto(layer):
             operations.YieldOperation(),
             layer.mlp.op_enqueue_experts,
             layer.mlp.op_shared_experts_keep_state,
+            layer.mlp.op_enqueue_experts_maybe_gpu,
             operations.YieldOperation(),
             layer.mlp.op_sync_experts,
             operations.YieldOperation(),
