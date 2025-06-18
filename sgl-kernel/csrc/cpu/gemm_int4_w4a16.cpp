@@ -207,7 +207,8 @@ struct brgemm {
       int64_t ldb,
       int64_t ldc,
       int64_t strideBz,
-      int64_t strideBs) {
+      int64_t strideBs,
+      bool use_brgemm_dequant_out) {
     TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
   }
 };
@@ -330,11 +331,27 @@ struct brgemm<at::BFloat16, has_bias> {
       int64_t ldb,
       int64_t ldc,
       int64_t strideBz,
-      int64_t strideBs) {
+      int64_t strideBs,
+      bool use_brgemm_dequant_out) {
     constexpr int BLOCK_N = block_size_n();
     const int ldb_tmp = BLOCK_N;
-    at::native::cpublas::brgemm(
-      M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
+    if (use_brgemm_dequant_out) {
+      at::native::cpublas::brgemm(
+        M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
+    } else {
+      for (int64_t k = 0; k < K; k += BLOCK_K) {
+        int64_t kb_size = std::min(static_cast<int64_t>(BLOCK_K), K - k);
+        const int64_t kgs = k / group_size;
+
+        unpack_B(Btmp, B + (k >> 1) * ldb, Bz + kgs * strideBz, Bs + kgs * strideBs,
+                N, kb_size, group_size, ldb, ldb_tmp, strideBz, strideBs);
+
+        const bool add_C = k != 0;
+        at::native::cpublas::brgemm(
+          M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
+      }
+    }
+
     // copy from Ctmp to C
     for (int64_t m = 0; m < M; ++m) {
       if constexpr (has_bias) {
@@ -366,12 +383,13 @@ void tinygemm_kernel(
     int64_t ldc,
     int64_t strideBz,
     int64_t strideBs,
-    bool brg) {
+    bool brg,
+    bool use_brgemm_dequant_out = false) {
 
   if (brg) {
     brgemm<scalar_t, has_bias>::apply(
       A, B, C, Bz, Bs, Btmp, Ctmp, bias, M, N, K,
-      group_size, lda, ldb, ldc, strideBz, strideBs);
+      group_size, lda, ldb, ldc, strideBz, strideBs, use_brgemm_dequant_out);
     return;
   }
 
@@ -425,10 +443,11 @@ void int4_w4a16_linear_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // TODO: find this threshold
+  // TODO: find these thresholds
   const bool use_brgemm = M > 4;
+  const bool use_brgemm_dequant_out = M > 512;
   scalar_t* Btmp_start = nullptr;
-  if (use_brgemm) {
+  if (use_brgemm_dequant_out) {
     at::Tensor Btmp_t = at::empty(
       {N, K}, c10::CppTypeToScalarType<scalar_t>::value);
    Btmp_start = Btmp_t.data_ptr<scalar_t>();
@@ -463,6 +482,7 @@ void int4_w4a16_linear_kernel_impl(
     parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
       // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+      alignas(64) scalar_t Btmp_inner[BLOCK_N * BLOCK_K];
       for (int64_t nbb = begin_nb; nbb < end_nb; nbb += cache_blocks_nb) {
       for (int64_t mb = begin_mb; mb < end_mb; ++mb) {
       for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
@@ -476,7 +496,7 @@ void int4_w4a16_linear_kernel_impl(
             /*   C  */ out + mb_start * out_strideM + nb_start,
             /*  Bz  */ w_zeros + nb_start,
             /*  Bs  */ w_scales + nb_start,
-            /* Btmp */ use_brgemm ? Btmp_start + nb_start*K : nullptr,
+            /* Btmp */ use_brgemm_dequant_out ? Btmp_start + nb_start*K : Btmp_inner,
             /* Ctmp */ Ctmp,
             /* bias */ bias + nb_start,
             /*   M  */ mb_size,
@@ -488,7 +508,8 @@ void int4_w4a16_linear_kernel_impl(
             /* ldc  */ out_strideM,
             /* sBz  */ N,
             /* sBs  */ N,
-            /* brg  */ use_brgemm);
+            /* brg  */ use_brgemm,
+            /* dequant choice*/ use_brgemm_dequant_out);
       }}}
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();
@@ -542,6 +563,7 @@ void tinygemm_kernel(
       int64_t strideBz,                       \
       int64_t strideBs,                       \
       bool brg)
+
 
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
