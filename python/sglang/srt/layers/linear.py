@@ -1136,9 +1136,13 @@ class QKVParallelLinear(ColumnParallelLinear):
             full_shard_size = shard_size * tp_size
             if full_shard_size > loaded_weight.size(output_dim) and start_idx >= loaded_weight.size(output_dim):
                 pad_size = start_idx + shard_size - loaded_weight.size(output_dim)
-                
-                pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
-                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=output_dim).to(loaded_weight.dtype)
+                if loaded_weight.dim() == 2:
+                    pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+                    loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=output_dim).to(loaded_weight.dtype)
+                else:
+                    pad_tensor = torch.zeros(pad_size).to(loaded_weight.dtype)
+                    loaded_weight = torch.cat([loaded_weight.unsqueeze(0), pad_tensor.unsqueeze(0)], dim=1).to(loaded_weight.dtype)
+                    loaded_weight = loaded_weight.squeeze(0)
                 if not use_bitsandbytes_4bit and not self.use_presharded_weights:
                     loaded_weight = loaded_weight.narrow(
                         output_dim, start_idx, shard_size
