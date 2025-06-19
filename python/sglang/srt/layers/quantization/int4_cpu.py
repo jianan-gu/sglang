@@ -266,7 +266,9 @@ class Int4CPULinearMethod(LinearMethodBase):
     ):
         if SGLANG_USE_CPU_W4A8:
             x_q, x_s = sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
-            dummy_zeros = torch.ones_like(x_s).to(torch.int)
+            dummy_zeros = torch.empty_like(x_s).to(torch.int)
+            # print(x_q.shape)
+            # print(layer.qweight.shape)
             return sgl_kernel.common_ops.da8w4_linear_impl(
                 x_q, x_s, dummy_zeros, layer.qweight, layer.scales, layer.qzeros, layer.compensation, bias, torch.bfloat16
             )
@@ -567,10 +569,14 @@ def _autoawq_to_int4pack_w4a8(
 ):
     t, zp = unpack_awq_weight(awq_qweight, awq_qzeros, awq_scales, bits, group_size)
     # # transpose -> [N, K]
-    t = t.T.contiguous()
-    qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
+    # t = t.T.contiguous()
+    qweight_ = t.T.contiguous().to(torch.uint8)
+    # qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
     scales_ = awq_scales.t().contiguous()
     zp_ = zp.t_().contiguous()
+    # print(qweight_.shape)
+    # print(scales_.shape)
+    # print(zp_.shape)
     import sgl_kernel
     qweight_, scales_, zp_ , comp = sgl_kernel.common_ops.da8w4_linear_prepack_impl(qweight_, scales_, zp_)
     return qweight_,  zp_, scales_, comp
