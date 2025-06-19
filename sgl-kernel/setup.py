@@ -149,6 +149,7 @@ nvcc_flags_fp8 = [
 sources = [
     "csrc/cpu/activation.cpp",
     "csrc/cpu/bmm.cpp",
+    "csrc/cpu/numa_utils.cpp",
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
@@ -156,6 +157,7 @@ sources = [
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/gemm_int4_w4a16.cpp",
     "csrc/cpu/gemm_int4_w4a8.cpp",
+    "csrc/cpu/gemm_int4_w4a8_ao.cpp",
     "csrc/cpu/moe.cpp",
     "csrc/cpu/moe_fp8.cpp",
     "csrc/cpu/moe_int8.cpp",
@@ -203,6 +205,9 @@ cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
 cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
 cpu_amx_int8 = version.parse(torch.__version__) >= version.parse("2.7")
+
+
+
 if cpu_amx_int8:
     print("Enable AMX-INT8 build on CPU kernels.")
 
@@ -251,7 +256,7 @@ if cpu_fp8_ftz:
 if cpu_amx_int8:
     extra_compile_args["cxx"].append("-DSGLANG_CPU_AMX_INT8")
 
-libraries = ["c10", "torch", "torch_python"]
+libraries = ["c10", "torch", "torch_python", "numa"]
 cuda_libraries = ["cuda", "cublas"]
 cmdclass = {
     "build_ext": BuildExtension.with_options(use_ninja=True),
@@ -274,7 +279,7 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linu
 
 # https://github.com/pytorch/pytorch/issues/152243
 py_limited_api = version.parse(torch.__version__) < version.parse("2.7")
-
+conda_prefix = os.getenv("CONDA_PREFIX", "")
 ext_modules = [
     Extension(
         name="sgl_kernel.common_ops",
@@ -282,6 +287,7 @@ ext_modules = [
         include_dirs=include_dirs,
         extra_compile_args=extra_compile_args,
         libraries=libraries,
+        library_dirs=[os.path.join(conda_prefix, "lib")] if conda_prefix else [],
         extra_link_args=extra_link_args,
         py_limited_api=py_limited_api,
     ),
