@@ -170,8 +170,60 @@ class Int4CPUConfig(QuantizationConfig):
             and group_size in cls._supported_group_sizes
             and zero_point == True
         )
+from torchao.quantization.quant_primitives import (
+    MappingType,
+)
+from torchao.dtypes import to_affine_quantized_intx
+from torchao.quantization.utils import _get_per_token_block_size
+def _int8_symm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
+    mapping_type = MappingType.SYMMETRIC
+    target_dtype = torch.int8
+    eps = 1e-5
+    quant_min = -127
+    quant_max = 127
 
+    res =  to_affine_quantized_intx(
+        x,
+        mapping_type,
+        _get_per_token_block_size(x),
+        target_dtype,
+        eps=eps,
+        quant_min=quant_min,
+        quant_max=quant_max,
+        scale_dtype=torch.float32,
+    )
+    return res.tensor_impl.get_plain()
 
+def _uint8_asymm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
+    mapping_type = MappingType.ASYMMETRIC
+    target_dtype = torch.uint8
+    scale_dtype = torch.float32
+    eps = torch.finfo(torch.float32).eps
+    zero_point_dtype = torch.int32
+    quant_min = 0
+    quant_max = 255
+    if True:
+        out = to_affine_quantized_intx(
+            x,
+            mapping_type,
+            _get_per_token_block_size(x),
+            target_dtype,
+            quant_min=quant_min,
+            quant_max=quant_max,
+            eps=eps,
+            scale_dtype=scale_dtype,
+            zero_point_dtype=zero_point_dtype,
+        )
+    else:
+        out = to_affine_quantized_intx(
+            x,
+            mapping_type,
+            _get_per_token_block_size(x),
+            target_dtype,
+            quant_min=quant_min,
+            quant_max=quant_max,
+        )
+    return out.tensor_impl.get_plain()
 class Int4CPULinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Int4CPUConfig):
@@ -265,8 +317,9 @@ class Int4CPULinearMethod(LinearMethodBase):
         bias: Optional[Tensor] = None,
     ):
         if SGLANG_USE_CPU_W4A8:
-            x_q, x_s = sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
-            dummy_zeros = torch.empty_like(x_s).to(torch.int)
+            # x_q, x_s = sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
+            # dummy_zeros = torch.empty_like(x_s).to(torch.int)
+            x_q, x_s, dummy_zeros =  _uint8_asymm_per_token_quant(x)
             # print(x_q.shape)
             # print(layer.qweight.shape)
             return sgl_kernel.common_ops.da8w4_linear_impl(
@@ -567,16 +620,26 @@ def _autoawq_to_int4pack_w4a8(
     bits: int=4,
     group_size: int=128,
 ):
-    t, zp = unpack_awq_weight(awq_qweight, awq_qzeros, awq_scales, bits, group_size)
-    # # transpose -> [N, K]
-    # t = t.T.contiguous()
-    qweight_ = t.T.contiguous().to(torch.uint8)
-    # qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
+
+    # t, zp = unpack_awq_weight(awq_qweight, awq_qzeros, awq_scales, bits, group_size)
+    # # # transpose -> [N, K]
+    # # t = t.T.contiguous()
+    # qweight_ = t.T.contiguous().to(torch.uint8)
+    # # qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
     scales_ = awq_scales.t().contiguous()
-    zp_ = zp.t_().contiguous()
+    # zp_ = zp.t_().contiguous()
     # print(qweight_.shape)
     # print(scales_.shape)
     # print(zp_.shape)
     import sgl_kernel
-    qweight_, scales_, zp_ , comp = sgl_kernel.common_ops.da8w4_linear_prepack_impl(qweight_, scales_, zp_)
+    bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
+    awq_qweight = (awq_qweight.unsqueeze(-1) >> bitshifts) & 0xF
+    awq_qweight = awq_qweight.flatten(-2).transpose(-1, -2).to(torch.uint8)
+    awq_qzeros = (awq_qzeros.unsqueeze(-1) >> bitshifts) & 0xF
+    awq_qzeros = awq_qzeros.flatten(-2).to(torch.uint8)
+    awq_qzeros = awq_qzeros.T.contiguous()
+    print(awq_qweight.shape)
+    print(awq_qzeros.shape)
+    print(scales_.shape)
+    qweight_, scales_, zp_ , comp = sgl_kernel.common_ops.da8w4_linear_prepack_impl(awq_qweight, scales_, awq_qzeros)
     return qweight_,  zp_, scales_, comp

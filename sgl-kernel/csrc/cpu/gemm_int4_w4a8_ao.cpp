@@ -702,7 +702,9 @@ at::Tensor da8w4_linear_impl(
   const std::optional<at::Tensor>& bias,
   at::ScalarType output_dtype) {
 static bool cpublas_can_pack = cpublas_could_pack();
+// auto input = input_.to(at::kChar);
 bool sym_quant_a = input.scalar_type() == c10::kChar;
+// std::cout<<sym_quant_a<<std::endl;
 auto out_sizes = input.sizes().vec();
 int64_t N = weight.size(0) * weight.size(-1) * 2;
 out_sizes.back() = N;
