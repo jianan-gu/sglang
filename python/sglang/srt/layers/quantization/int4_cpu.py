@@ -32,6 +32,8 @@ try:
 except ImportError:
     _has_amx = False
 
+print(_has_amx)
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,10 +148,10 @@ class Int4CPUConfig(QuantizationConfig):
 
     @classmethod
     def is_compatible(cls, quant_config: Dict[str, Any]):
-        from vllm.platforms import current_platform
+        # from vllm.platforms import current_platform
 
-        if not current_platform.is_cpu():
-            return False
+        # if not current_platform.is_cpu():
+        #     return False
 
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
