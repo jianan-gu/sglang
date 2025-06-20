@@ -142,16 +142,29 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
         weight_tensor = getattr(module, weight_name)
         if transpose_dims and transpose_dims[i]:
             weight_tensor = weight_tensor.transpose(*transpose_dims[i])
-
-        setattr(
-            module,
-            weight_name,
-            torch.nn.Parameter(
-                prepack_weight_if_needed(weight_tensor),
-                requires_grad=False,
-            ),
-        )
-
+        module.use_intel_amx_backend_fallback = False
+        if device == torch.device("cpu") and cpu_has_amx_support():
+            could_pack_n = weight_tensor.size(0) % 16 == 0 #N
+            could_pack_k = weight_tensor.size(1) % 32 == 0 #K
+            module.use_intel_amx_backend_fallback = not could_pack_n or not could_pack_k
+        if not module.use_intel_amx_backend_fallback:
+            setattr(
+                module,
+                weight_name,
+                torch.nn.Parameter(
+                    prepack_weight_if_needed(weight_tensor),
+                    requires_grad=False,
+                ),
+            )
+        else:
+            setattr(
+                module,
+                weight_name,
+                torch.nn.Parameter(
+                    weight_tensor,
+                    requires_grad=False,
+                ),
+            )
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
     )

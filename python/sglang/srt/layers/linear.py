@@ -185,7 +185,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if layer.use_intel_amx_backend:
+        if layer.use_intel_amx_backend and not layer.use_intel_amx_backend_fallback:
             return sgl_kernel.cpu.weight_packed_linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
