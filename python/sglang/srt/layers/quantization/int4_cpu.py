@@ -32,7 +32,6 @@ try:
 except ImportError:
     _has_amx = False
 
-print(_has_amx)
 
 logger = logging.getLogger(__name__)
 
