@@ -599,6 +599,14 @@ class DeepseekV2MoE(nn.Module):
             state.gpu_experts_result = None
 
     def op_sync_experts(self, state):
+        if (
+            state.forward_batch.forward_mode is not None
+        ) and not state.forward_batch.forward_mode.is_idle():
+            self.experts.forward_routed_experts_sync(
+                hidden_states_device=state.get("hidden_states_device"),
+            )
+
+    def op_combine_heto_experts(self, state):
         hidden_states_shape = state.pop("hidden_states_shape")
         hidden_states_device = state.pop("hidden_states_device")
         hidden_states_dtype = state.pop("hidden_states_dtype")
@@ -606,7 +614,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             state.forward_batch.forward_mode is not None
         ) and not state.forward_batch.forward_mode.is_idle():
-            combined = self.experts.forward_routed_experts_sync(
+            combined = self.experts.forward_routed_experts_combine(
                 hidden_states_shape=hidden_states_shape,
                 hidden_states_device=hidden_states_device,
                 hidden_states_dtype=hidden_states_dtype,

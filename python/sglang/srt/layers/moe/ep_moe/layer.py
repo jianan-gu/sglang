@@ -1003,17 +1003,16 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             )
             return self.adhoc_cpu_result
 
-    def forward_sync(self, hidden_states_shape, hidden_states_device, cpu_result):
+    def forward_sync(self, hidden_states_device):
+        self.cpu_infer.sync_with_cuda_stream(
+            torch.cuda.current_stream(hidden_states_device).cuda_stream
+        )
+
+    def forward_to_gpu(self, hidden_states_shape, hidden_states_device, cpu_result):
         bs = hidden_states_shape[0]
         if torch.cuda.is_current_stream_capturing() or bs <= self.cached_tensors_size:
-            self.cpu_infer.sync_with_cuda_stream(
-                torch.cuda.current_stream(hidden_states_device).cuda_stream
-            )
             return cpu_result.to(hidden_states_device, non_blocking=True)
         else:
-            self.cpu_infer.sync_with_cuda_stream(
-                torch.cuda.current_stream(hidden_states_device).cuda_stream
-            )
             return self.adhoc_gpu_result.copy_(cpu_result, non_blocking=True)
 
     def forward(self):
@@ -1190,7 +1189,10 @@ class EPMoEHeto(EPMoESparse):
         gpu_result = self.forward_routed_experts_maybe_gpu(
             hidden_states, router_logits  # here hidden_states will be destroyed
         )
-        result = self.forward_routed_experts_sync(
+        self.forward_routed_experts_sync(
+            hidden_states_device,
+        )
+        result = self.forward_routed_experts_combine(
             hidden_states_shape,
             hidden_states_device,
             hidden_states_dtype,
@@ -1227,6 +1229,13 @@ class EPMoEHeto(EPMoESparse):
 
     def forward_routed_experts_sync(
         self,
+        hidden_states_device,
+    ):
+        if self.cpu_moe:
+            self.cpu_moe.forward_sync(hidden_states_device)
+
+    def forward_routed_experts_combine(
+        self,
         hidden_states_shape,
         hidden_states_device,
         hidden_states_dtype,
@@ -1234,7 +1243,7 @@ class EPMoEHeto(EPMoESparse):
         cpu_result,
     ):
         if self.cpu_moe:
-            cpu_result_on_gpu = self.cpu_moe.forward_sync(
+            cpu_result_on_gpu = self.cpu_moe.forward_to_gpu(
                 hidden_states_shape, hidden_states_device, cpu_result
             )
 
