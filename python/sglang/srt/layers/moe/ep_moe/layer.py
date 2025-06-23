@@ -956,9 +956,6 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             self.adhoc_cpu_result = torch.zeros_like(
                 hidden_states, device=self.device, pin_memory=True
             )
-            self.adhoc_gpu_result = torch.zeros_like(
-                hidden_states, device=hidden_states.device
-            )
             self.adhoc_hidden_states_cpu = hidden_states.to(
                 self.device, non_blocking=True
             )
@@ -1008,12 +1005,8 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             torch.cuda.current_stream(hidden_states_device).cuda_stream
         )
 
-    def forward_to_gpu(self, hidden_states_shape, hidden_states_device, cpu_result):
-        bs = hidden_states_shape[0]
-        if torch.cuda.is_current_stream_capturing() or bs <= self.cached_tensors_size:
-            return cpu_result.to(hidden_states_device, non_blocking=True)
-        else:
-            return self.adhoc_gpu_result.copy_(cpu_result, non_blocking=True)
+    def forward_to_gpu(self, hidden_states_device, cpu_result):
+        return cpu_result.to(hidden_states_device, non_blocking=True)
 
     def forward(self):
         raise NotImplementedError("forward Not implemented")
@@ -1244,7 +1237,7 @@ class EPMoEHeto(EPMoESparse):
     ):
         if self.cpu_moe:
             cpu_result_on_gpu = self.cpu_moe.forward_to_gpu(
-                hidden_states_shape, hidden_states_device, cpu_result
+                hidden_states_device, cpu_result
             )
 
         if gpu_result is None:
