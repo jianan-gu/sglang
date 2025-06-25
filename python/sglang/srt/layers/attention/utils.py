@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-
+import torch
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
@@ -90,3 +90,32 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+
+
+def create_torch_native_kv_indices(
+    req_to_token: torch.Tensor,        # [max_batch, max_context_len], int64
+    req_pool_indices: torch.Tensor,    # [bs], int32 or int64
+    paged_kernel_lens: torch.Tensor,   # [bs], int32 or int64
+    kv_indptr: torch.Tensor,           # [bs], int32 or int64
+    kv_start_idx: torch.Tensor,        # [bs] or None, int32 or int64
+    req_to_token_stride: int           # typically req_to_token.shape[1]
+) -> torch.Tensor:
+    bs = req_pool_indices.shape[0]
+    total_len = kv_indptr[-1].item() + paged_kernel_lens[-1].item()  # max estimate
+    kv_indices = torch.zeros(total_len, dtype=torch.int64, device=req_to_token.device)
+
+    for i in range(bs):
+        req_pool_index = req_pool_indices[i].item()
+        kv_offset = kv_indptr[i].item()
+        kv_start = 0
+        kv_end = 0
+        if kv_start_idx is not None:
+            kv_start = kv_start_idx[i].item()
+            kv_end = kv_start
+        kv_end += paged_kernel_lens[i].item()
+
+        data = req_to_token[req_pool_index, kv_start:kv_end]
+        kv_indices[kv_offset:kv_offset + kv_end - kv_start] = data
+
+    return kv_indices
