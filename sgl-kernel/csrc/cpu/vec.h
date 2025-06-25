@@ -157,7 +157,7 @@ inline void quantize_row_int8<at::BFloat16>(uint8_t* __restrict__ Aq, float& As,
     const at::BFloat16* __restrict__ A, int64_t K, float eps) {
 
   const __m512 signBit = _mm512_set1_ps(-0.0f);
-  const __m512i off = _mm512_set1_epi32(128);
+  const __m512i off = _mm512_set1_epi32(0);
 
   // K is 32x, no remainder
   float amax = 0.f;

@@ -147,10 +147,10 @@ class Int4CPUConfig(QuantizationConfig):
 
     @classmethod
     def is_compatible(cls, quant_config: Dict[str, Any]):
-        from vllm.platforms import current_platform
+        # from vllm.platforms import current_platform
 
-        if not current_platform.is_cpu():
-            return False
+        # if not current_platform.is_cpu():
+        #     return False
 
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
@@ -181,7 +181,7 @@ def _int8_symm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
     eps = 1e-5
     quant_min = -127
     quant_max = 127
-
+    # print(_get_per_token_block_size(x))
     res =  to_affine_quantized_intx(
         x,
         mapping_type,
@@ -190,10 +190,13 @@ def _int8_symm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
         eps=eps,
         quant_min=quant_min,
         quant_max=quant_max,
-        scale_dtype=torch.float32,
+        scale_dtype=torch.float,
     )
-    return res.tensor_impl.get_plain()
-
+    # return res.tensor_impl.get_plain()
+    act = res.tensor_impl.int_data
+    act_scales = res.tensor_impl.scale
+    act_qzeros = res.tensor_impl.zero_point
+    return act, act_scales, act_qzeros
 def _uint8_asymm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
     mapping_type = MappingType.ASYMMETRIC
     target_dtype = torch.uint8
@@ -223,7 +226,11 @@ def _uint8_asymm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
             quant_min=quant_min,
             quant_max=quant_max,
         )
-    return out.tensor_impl.get_plain()
+    # return out.tensor_impl.get_plain()
+    act = out.tensor_impl.int_data
+    act_scales = out.tensor_impl.scale
+    act_qzeros = out.tensor_impl.zero_point
+    return act, act_scales, act_qzeros
 class Int4CPULinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Int4CPUConfig):
@@ -293,6 +300,10 @@ class Int4CPULinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if SGLANG_USE_CPU_W4A8:
+            # torch.save(layer.qweight.data, "awq_weight.pt")
+            # torch.save(layer.qzeros.data, "awq_qzeros.pt")
+            # torch.save(layer.scales.data, "awq_scales.pt")
+            # exit(0)
             qweight, qzeros, scales, compensation = _autoawq_to_int4pack_w4a8(
                 layer.qweight.data, layer.qzeros.data, layer.scales.data
             )
@@ -317,12 +328,18 @@ class Int4CPULinearMethod(LinearMethodBase):
         bias: Optional[Tensor] = None,
     ):
         if SGLANG_USE_CPU_W4A8:
-            # x_q, x_s = sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
+            x_q, x_s = sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
+            x_q = x_q.to(torch.int8)
+            # 
+            # # x_q, x_s, dummy_zeros =  _uint8_asymm_per_token_quant(x)
+            # x_q, x_s, _ =  _int8_symm_per_token_quant(x)
             # dummy_zeros = torch.empty_like(x_s).to(torch.int)
-            x_q, x_s, dummy_zeros =  _uint8_asymm_per_token_quant(x)
             # print(x_q.shape)
             # print(layer.qweight.shape)
-            return sgl_kernel.common_ops.da8w4_linear_impl(
+            # print(dummy_zeros)
+            # x_q, x_s = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x)
+            dummy_zeros = torch.empty_like(x_s).to(torch.int)
+            return torch.ops.sgl_kernel.da8w4_linear_cpu(
                 x_q, x_s, dummy_zeros, layer.qweight, layer.scales, layer.qzeros, layer.compensation, bias, torch.bfloat16
             )
         else:
@@ -621,25 +638,29 @@ def _autoawq_to_int4pack_w4a8(
     group_size: int=128,
 ):
 
-    # t, zp = unpack_awq_weight(awq_qweight, awq_qzeros, awq_scales, bits, group_size)
-    # # # transpose -> [N, K]
-    # # t = t.T.contiguous()
-    # qweight_ = t.T.contiguous().to(torch.uint8)
-    # # qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
-    scales_ = awq_scales.t().contiguous()
-    # zp_ = zp.t_().contiguous()
+    t, zp = unpack_awq_weight(awq_qweight, awq_qzeros, awq_scales, bits, group_size)
+    # # # # transpose -> [N, K]
+    # t = t.T.contiguous()
+    awq_qweight_2 = t.T.contiguous().to(torch.uint8)
+    # qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
+    scales_ = awq_scales.T.contiguous()
+    awq_qzeros = zp.T.contiguous()
     # print(qweight_.shape)
     # print(scales_.shape)
     # print(zp_.shape)
     import sgl_kernel
-    bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
-    awq_qweight = (awq_qweight.unsqueeze(-1) >> bitshifts) & 0xF
-    awq_qweight = awq_qweight.flatten(-2).transpose(-1, -2).to(torch.uint8)
-    awq_qzeros = (awq_qzeros.unsqueeze(-1) >> bitshifts) & 0xF
-    awq_qzeros = awq_qzeros.flatten(-2).to(torch.uint8)
-    awq_qzeros = awq_qzeros.T.contiguous()
-    print(awq_qweight.shape)
-    print(awq_qzeros.shape)
-    print(scales_.shape)
-    qweight_, scales_, zp_ , comp = sgl_kernel.common_ops.da8w4_linear_prepack_impl(awq_qweight, scales_, awq_qzeros)
+    
+    # bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
+    # awq_qweight = (awq_qweight.unsqueeze(-1) >> bitshifts) & 0xF
+    # awq_qweight = awq_qweight.flatten(-2).transpose(-1, -2).to(torch.uint8)
+    # awq_qzeros = (awq_qzeros.unsqueeze(-1) >> bitshifts) & 0xF
+    # awq_qzeros = awq_qzeros.flatten(-2).to(torch.uint8)
+    # awq_qzeros = awq_qzeros.T.contiguous()
+    # print(awq_qweight.shape)
+    # print(awq_qzeros.shape)
+    # print(awq_qweight_2 == awq_qweight)
+    # print(zp.T.contiguous() == awq_qzeros)
+    qweight_, scales_, zp_ , comp = torch.ops.sgl_kernel.da8w4_linear_prepack_cpu(awq_qweight_2, scales_, awq_qzeros)
+    # print(comp.shape)
     return qweight_,  zp_, scales_, comp
+

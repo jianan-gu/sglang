@@ -235,29 +235,29 @@ void rotary_embedding_cpu(at::Tensor& positions, at::Tensor& query,
     at::Tensor& key, int64_t head_size,
     at::Tensor& cos_sin_cache, bool is_neox);
 
-at::Tensor da8w4_linear_impl(
-    const at::Tensor& input,
-    const at::Tensor& input_scales,
-    const at::Tensor& input_qzeros,
-    const at::Tensor& weight,
-    const at::Tensor& weight_scales,
-    const at::Tensor& weight_qzeros,
-    const at::Tensor& compensation,
-    const std::optional<at::Tensor>& bias,
-    at::ScalarType output_dtype);
+// at::Tensor da8w4_linear_impl(
+//     const at::Tensor& input,
+//     const at::Tensor& input_scales,
+//     const at::Tensor& input_qzeros,
+//     const at::Tensor& weight,
+//     const at::Tensor& weight_scales,
+//     const at::Tensor& weight_qzeros,
+//     const at::Tensor& compensation,
+//     const at::Tensor& bias,
+//     at::ScalarType output_dtype);
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-da8w4_linear_prepack_impl(
-    const at::Tensor& weight,
-    const at::Tensor& scales,
-    const at::Tensor& qzeros);
+// std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+// da8w4_linear_prepack_impl(
+//     const at::Tensor& weight,
+//     const at::Tensor& scales,
+//     const at::Tensor& qzeros);
 
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("init_cpu_threads_env", &init_cpu_threads_env, "W8A8");
-  m.def("da8w4_linear_impl", &da8w4_linear_impl, "W8A8");
-  m.def("da8w4_linear_prepack_impl", &da8w4_linear_prepack_impl, "W8A8 pack");
+//   m.def("da8w4_linear_impl", &da8w4_linear_impl, "W8A8");
+//   m.def("da8w4_linear_prepack_impl", &da8w4_linear_prepack_impl, "W8A8 pack");
   // activation
   m.def("silu_and_mul_cpu", &silu_and_mul_cpu, "SiLU and mul for CPU");
   m.def("rotary_embedding_cpu", &rotary_embedding_cpu, "rope for CPU");
@@ -328,3 +328,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // rope
   m.def("rotary_position_embedding_cpu", &rotary_position_embedding_cpu, "rotary position embedding for CPU");
 }
+// TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+//     m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
+//     m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);
+//   }
+//   TORCH_LIBRARY_IMPL(sgl_kernel, CPU, m) {
+//     m.impl("da8w4_linear_impl", &da8w4_linear_impl);
+//   }
+//   at::Tensor da8w4_linear_impl(
+//     const at::Tensor& input,
+//     const at::Tensor& input_scales,
+//     const at::Tensor& input_qzeros,
+//     const at::Tensor& weight,
+//     const at::Tensor& weight_scales,
+//     const at::Tensor& weight_qzeros,
+//     const at::Tensor& compensation,
+//     const at::Tensor& bias,
+//     at::ScalarType output_dtype);
