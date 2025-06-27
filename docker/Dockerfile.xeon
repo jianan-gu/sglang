@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG VER_SGLANG=qwen3_support
+ARG VER_SGLANG=mlperf_support
 
 RUN apt-get update && \
     apt-get full-upgrade -y && \
@@ -32,13 +32,14 @@ RUN pip config set global.index-url https://download.pytorch.org/whl/cpu && \
     pip config set global.extra-index-url https://pypi.org/simple && \
     pip install cmake==3.31.2 \
     "setuptools-scm>=8" \
-    intel-openmp
+    intel-openmp==2024.2.0
 
 RUN git clone https://github.com/jianan-gu/sglang.git && \
     cd sglang && \
     git checkout ${VER_SGLANG} && \
     pip install -e "python[all_cpu]" && \
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 triton==3.1.0 --force-reinstall && \
+    pip install torch torchvision --force-reinstall --index-url https://download.pytorch.org/whl/nightly/cpu \
+    pip install triton==3.1.0 --force-reinstall && \
     cd sgl-kernel && \
     python setup.py install
 
