@@ -337,20 +337,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // rope
   m.def("rotary_position_embedding_cpu", &rotary_position_embedding_cpu, "rotary position embedding for CPU");
 }
-// TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-//     m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
-//     m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);
-//   }
-//   TORCH_LIBRARY_IMPL(sgl_kernel, CPU, m) {
-//     m.impl("da8w4_linear_impl", &da8w4_linear_impl);
-//   }
-//   at::Tensor da8w4_linear_impl(
-//     const at::Tensor& input,
-//     const at::Tensor& input_scales,
-//     const at::Tensor& input_qzeros,
-//     const at::Tensor& weight,
-//     const at::Tensor& weight_scales,
-//     const at::Tensor& weight_qzeros,
-//     const at::Tensor& compensation,
-//     const at::Tensor& bias,
-//     at::ScalarType output_dtype);

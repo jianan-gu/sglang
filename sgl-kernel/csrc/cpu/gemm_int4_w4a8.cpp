@@ -4,8 +4,6 @@
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
 
-
-
 namespace {
 
 #define BLOCK_N 32
