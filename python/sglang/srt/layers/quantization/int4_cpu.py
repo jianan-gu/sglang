@@ -300,10 +300,6 @@ class Int4CPULinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if SGLANG_USE_CPU_W4A8:
-            # torch.save(layer.qweight.data, "awq_weight.pt")
-            # torch.save(layer.qzeros.data, "awq_qzeros.pt")
-            # torch.save(layer.scales.data, "awq_scales.pt")
-            # exit(0)
             qweight, qzeros, scales, compensation = _autoawq_to_int4pack_w4a8(
                 layer.qweight.data, layer.qzeros.data, layer.scales.data
             )
@@ -316,6 +312,7 @@ class Int4CPULinearMethod(LinearMethodBase):
         layer.scales = nn.Parameter(scales, requires_grad=False)
         if SGLANG_USE_CPU_W4A8:
             layer.compensation = nn.Parameter(compensation, requires_grad=False)
+            layer._x_dummy_zp = nn.Parameter(torch.ones(1), requires_grad=False)
         if getattr(layer, "bias", None) is not None:
             layer.bias = nn.Parameter(layer.bias.data.float(), requires_grad=False)
 
@@ -328,20 +325,11 @@ class Int4CPULinearMethod(LinearMethodBase):
         bias: Optional[Tensor] = None,
     ):
         if SGLANG_USE_CPU_W4A8:
-            x_q, x_s = sgl_kernel.common_ops.per_token_quant_int8_cpu(x)
-            x_q = x_q.to(torch.int8)
-            # 
-            # # x_q, x_s, dummy_zeros =  _uint8_asymm_per_token_quant(x)
-            # x_q, x_s, _ =  _int8_symm_per_token_quant(x)
-            # dummy_zeros = torch.empty_like(x_s).to(torch.int)
-            # print(x_q.shape)
-            # print(layer.qweight.shape)
-            # print(dummy_zeros)
-            # x_q, x_s = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x)
-            dummy_zeros = torch.empty_like(x_s).to(torch.int)
-            return torch.ops.sgl_kernel.da8w4_linear_cpu(
-                x_q, x_s, dummy_zeros, layer.qweight, layer.scales, layer.qzeros, layer.compensation, bias, torch.bfloat16
-            )
+            return sgl_kernel.common_ops.da8w4_linear_cpu_with_quant(x, layer.qweight, layer.scales, layer.qzeros, layer.compensation, bias, torch.bfloat16)
+            # x_q, x_s = torch.ops.sgl_kernel.per_token_quant_int8_cpu_sym(x)
+            # return sgl_kernel.common_ops.da8w4_linear_cpu(
+            #     x_q, x_s, layer._x_dummy_zp, layer.qweight, layer.scales, layer.qzeros, layer.compensation, bias, torch.bfloat16
+            # )
         else:
             return sgl_kernel.cpu.int4_w4a16_linear(
                 x, layer.qweight, layer.qzeros, layer.scales, bias
@@ -442,31 +430,19 @@ class Int4CPUMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if SGLANG_USE_CPU_W4A8:
-            w13_qweight, w13_qzeros, w13_scales, w13_com = _autoawq_to_int4pack_w4a8(
-                layer.w13_qweight.data, layer.w13_qzeros.data, layer.w13_scales.data
-            )
-        else:
-            w13_qweight, w13_qzeros, w13_scales = _autoawq_to_int4pack(
-                layer.w13_qweight.data, layer.w13_qzeros.data, layer.w13_scales.data
-            )
+            assert False, "MOE W4A8 has not implemented"
+        w13_qweight, w13_qzeros, w13_scales = _autoawq_to_int4pack(
+            layer.w13_qweight.data, layer.w13_qzeros.data, layer.w13_scales.data
+        )
         layer.w13_qweight = nn.Parameter(w13_qweight, requires_grad=False)
         layer.w13_qzeros = nn.Parameter(w13_qzeros, requires_grad=False)
         layer.w13_scales = nn.Parameter(w13_scales, requires_grad=False)
-        if SGLANG_USE_CPU_W4A8:
-            layer.w13_com = nn.Parameter(w13_com, requires_grad=False)
-        if SGLANG_USE_CPU_W4A8:
-            w2_qweight, w2_qzeros, w2_scales, w2_com = _autoawq_to_int4pack_w4a8(
-                layer.w2_qweight.data, layer.w2_qzeros.data, layer.w2_scales.data
-            )
-        else:
-            w2_qweight, w2_qzeros, w2_scales = _autoawq_to_int4pack(
-                layer.w2_qweight.data, layer.w2_qzeros.data, layer.w2_scales.data
-            )
+        w2_qweight, w2_qzeros, w2_scales = _autoawq_to_int4pack(
+            layer.w2_qweight.data, layer.w2_qzeros.data, layer.w2_scales.data
+        )
         layer.w2_qweight = nn.Parameter(w2_qweight, requires_grad=False)
         layer.w2_qzeros = nn.Parameter(w2_qzeros, requires_grad=False)
         layer.w2_scales = nn.Parameter(w2_scales, requires_grad=False)
-        if SGLANG_USE_CPU_W4A8:
-            layer.w2_com = nn.Parameter(w2_com, requires_grad=False)
         layer.use_intel_amx_backend = False
 
     def apply(
@@ -639,28 +615,9 @@ def _autoawq_to_int4pack_w4a8(
 ):
 
     t, zp = unpack_awq_weight(awq_qweight, awq_qzeros, awq_scales, bits, group_size)
-    # # # # transpose -> [N, K]
-    # t = t.T.contiguous()
-    awq_qweight_2 = t.T.contiguous().to(torch.uint8)
-    # qweight_ = t[:, 1::2].bitwise_left_shift(4).bitwise_or_(t[:, ::2]).to(torch.uint8)
+    qweight_ = t.T.contiguous().to(torch.uint8)
     scales_ = awq_scales.T.contiguous()
-    awq_qzeros = zp.T.contiguous()
-    # print(qweight_.shape)
-    # print(scales_.shape)
-    # print(zp_.shape)
-    import sgl_kernel
-    
-    # bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
-    # awq_qweight = (awq_qweight.unsqueeze(-1) >> bitshifts) & 0xF
-    # awq_qweight = awq_qweight.flatten(-2).transpose(-1, -2).to(torch.uint8)
-    # awq_qzeros = (awq_qzeros.unsqueeze(-1) >> bitshifts) & 0xF
-    # awq_qzeros = awq_qzeros.flatten(-2).to(torch.uint8)
-    # awq_qzeros = awq_qzeros.T.contiguous()
-    # print(awq_qweight.shape)
-    # print(awq_qzeros.shape)
-    # print(awq_qweight_2 == awq_qweight)
-    # print(zp.T.contiguous() == awq_qzeros)
-    qweight_, scales_, zp_ , comp = torch.ops.sgl_kernel.da8w4_linear_prepack_cpu(awq_qweight_2, scales_, awq_qzeros)
-    # print(comp.shape)
+    qzeros_ = zp.T.contiguous()
+    qweight_, scales_, zp_ , comp = sgl_kernel.common_ops.da8w4_linear_prepack_cpu(qweight_, scales_, qzeros_)
     return qweight_,  zp_, scales_, comp
 

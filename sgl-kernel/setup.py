@@ -157,7 +157,6 @@ sources = [
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/gemm_int4_w4a16.cpp",
     "csrc/cpu/gemm_int4_w4a8.cpp",
-    "csrc/cpu/gemm_int4_w4a8_ao.cpp",
     "csrc/cpu/moe.cpp",
     "csrc/cpu/moe_fp8.cpp",
     "csrc/cpu/moe_int8.cpp",
