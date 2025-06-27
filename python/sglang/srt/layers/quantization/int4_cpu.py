@@ -170,67 +170,7 @@ class Int4CPUConfig(QuantizationConfig):
             and group_size in cls._supported_group_sizes
             and zero_point == True
         )
-from torchao.quantization.quant_primitives import (
-    MappingType,
-)
-from torchao.dtypes import to_affine_quantized_intx
-from torchao.quantization.utils import _get_per_token_block_size
-def _int8_symm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
-    mapping_type = MappingType.SYMMETRIC
-    target_dtype = torch.int8
-    eps = 1e-5
-    quant_min = -127
-    quant_max = 127
-    # print(_get_per_token_block_size(x))
-    res =  to_affine_quantized_intx(
-        x,
-        mapping_type,
-        _get_per_token_block_size(x),
-        target_dtype,
-        eps=eps,
-        quant_min=quant_min,
-        quant_max=quant_max,
-        scale_dtype=torch.float,
-    )
-    # return res.tensor_impl.get_plain()
-    act = res.tensor_impl.int_data
-    act_scales = res.tensor_impl.scale
-    act_qzeros = res.tensor_impl.zero_point
-    return act, act_scales, act_qzeros
-def _uint8_asymm_per_token_quant(x: torch.Tensor) -> torch.Tensor:
-    mapping_type = MappingType.ASYMMETRIC
-    target_dtype = torch.uint8
-    scale_dtype = torch.float32
-    eps = torch.finfo(torch.float32).eps
-    zero_point_dtype = torch.int32
-    quant_min = 0
-    quant_max = 255
-    if True:
-        out = to_affine_quantized_intx(
-            x,
-            mapping_type,
-            _get_per_token_block_size(x),
-            target_dtype,
-            quant_min=quant_min,
-            quant_max=quant_max,
-            eps=eps,
-            scale_dtype=scale_dtype,
-            zero_point_dtype=zero_point_dtype,
-        )
-    else:
-        out = to_affine_quantized_intx(
-            x,
-            mapping_type,
-            _get_per_token_block_size(x),
-            target_dtype,
-            quant_min=quant_min,
-            quant_max=quant_max,
-        )
-    # return out.tensor_impl.get_plain()
-    act = out.tensor_impl.int_data
-    act_scales = out.tensor_impl.scale
-    act_qzeros = out.tensor_impl.zero_point
-    return act, act_scales, act_qzeros
+
 class Int4CPULinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Int4CPUConfig):
