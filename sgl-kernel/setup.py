@@ -149,12 +149,14 @@ nvcc_flags_fp8 = [
 sources = [
     "csrc/cpu/activation.cpp",
     "csrc/cpu/bmm.cpp",
+    "csrc/cpu/numa_utils.cpp",
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
     "csrc/cpu/gemm_fp8.cpp",
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/gemm_int4_w4a16.cpp",
+    "csrc/cpu/gemm_int4_w4a8.cpp",
     "csrc/cpu/moe.cpp",
     "csrc/cpu/moe_fp8.cpp",
     "csrc/cpu/moe_int8.cpp",
@@ -203,6 +205,9 @@ cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
 cpu_fp8_ftz = os.getenv("SGLANG_CPU_FP8_CVT_FTZ", "1") == "1"
 cpu_amx_int8 = version.parse(torch.__version__) >= version.parse("2.7")
+
+
+
 if cpu_amx_int8:
     print("Enable AMX-INT8 build on CPU kernels.")
 
