@@ -364,6 +364,7 @@ def weight_packed_linear(
     bias,
     is_vnni=True,
 ):
+    x = x.view(-1, weight.size(-1))
     return sgl_kernel.common_ops.weight_packed_linear(
         x,
         weight,
