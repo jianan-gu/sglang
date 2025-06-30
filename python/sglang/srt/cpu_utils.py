@@ -64,11 +64,15 @@ def update_config(
 ) -> ModelConfig:
     # Support the case where the num_attention_heads is not divisible by the TP size.
     if model_config.num_attention_heads % tp_size != 0 or model_config.num_key_value_heads % tp_size != 0 :
+        quant_method = None
+        if hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, "quantization_config") and "quant_method" in model_config.hf_config.quantization_config:
+            quant_method = model_config.hf_config.quantization_config["quant_method"]
+
         # Compute the head_dim using the model_config.num_attention_heads before padding
         model_config.hf_config.original_head_dim = (
             model_config.hidden_size // model_config.num_attention_heads
         )        
-        
+
         model_config.hf_config.num_attention_heads_ori = model_config.num_attention_heads
         model_config.hf_text_config.num_attention_heads_ori = model_config.num_attention_heads
         model_config.hf_config.num_key_value_heads_ori = model_config.get_total_num_kv_heads()
@@ -77,7 +81,9 @@ def update_config(
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
         )
         total_kv_heads = model_config.get_total_num_kv_heads()
-        num_key_value_heads = pad_vocab_size(total_kv_heads, tp_size)
+
+        # TODO make general awq padding for TP3
+        num_key_value_heads = 12 if tp_size == 3 and quant_method == "awq" else pad_vocab_size(total_kv_heads, tp_size)
 
         model_config.num_key_value_heads = num_key_value_heads
         model_config.hf_config.num_key_value_heads = num_key_value_heads
@@ -88,11 +94,15 @@ def update_config(
         model_config.hf_config.num_attention_heads = num_attention_heads
         model_config.hf_text_config.num_attention_heads = num_attention_heads
 
-        # num_attention_heads_o = pad_vocab_size(model_config.hf_config.num_attention_heads_ori, tp_size)
-        # model_config.hf_config.num_attention_heads_o = num_attention_heads_o
-        # model_config.hf_text_config.num_attention_heads_o = num_attention_heads_o
+    # Int4 AWQ format padding
+    if hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, "quantization_config") and "group_size" in model_config.hf_config.quantization_config:
+        quantization_group_size = model_config.hf_config.quantization_config["group_size"]
+        import math
+        NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) // tp_size
+        intermediate_padding_size = tp_size * NEW_MOE_PADDING_SIZE
+    else:
+        intermediate_padding_size = tp_size * DEFAULT_MOE_PADDING_SIZE
 
-    intermediate_padding_size = tp_size * DEFAULT_MOE_PADDING_SIZE
     model_config = update_intermediate_size(model_config, "moe_intermediate_size", intermediate_padding_size)
     model_config = update_intermediate_size(model_config, "intermediate_size", intermediate_padding_size)
     model_config = update_intermediate_size(model_config, "intermediate_size_mlp", intermediate_padding_size)

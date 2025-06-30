@@ -195,8 +195,12 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         start_idx = shard_id * shard_size
         if full_shard_size > loaded_weight.size(self.output_dim) and start_idx >= loaded_weight.size(self.output_dim):
             pad_size = start_idx + shard_size - loaded_weight.size(self.output_dim)
-            pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
-            loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.output_dim).to(loaded_weight.dtype)
+            if self.output_dim == 0:
+                pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.output_dim).to(loaded_weight.dtype)
+            else: #AWQ case is transpose NxK to KxN
+                pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.output_dim).to(loaded_weight.dtype)
             if not use_bitsandbytes_4bit and not use_presharded_weights:
                 loaded_weight = loaded_weight.narrow(
                     self.output_dim, start_idx, shard_size
@@ -283,8 +287,12 @@ class RowvLLMParameter(BasevLLMParameter):
             start_idx = shard_id * shard_size
             if full_shard_size > loaded_weight.size(self.input_dim) and start_idx >= loaded_weight.size(self.input_dim):
                 pad_size = start_idx + shard_size - loaded_weight.size(self.input_dim)
-                pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
-                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.input_dim).to(loaded_weight.dtype)
+                if self.input_dim == 0:  #AWQ case is transpose NxK to KxN
+                    pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+                    loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.input_dim).to(loaded_weight.dtype)
+                else:
+                    pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
+                    loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=self.input_dim).to(loaded_weight.dtype)
                 if not use_presharded_weights:
                     loaded_weight = loaded_weight.narrow(
                         self.input_dim, start_idx, shard_size
