@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG VER_SGLANG=mlperf_support
+ARG VER_SGLANG=qwen3_support
 
 RUN apt-get update && \
     apt-get full-upgrade -y && \
@@ -26,7 +26,7 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
 
 ENV PATH=/root/miniforge3/bin:/root/miniforge3/condabin:${PATH}
 ENV PIP_ROOT_USER_ACTION=ignore
-ENV CONDA_PREFIX=/sgl-workspace/miniforge3
+ENV CONDA_PREFIX=/root/miniforge3
 
 RUN pip config set global.extra-index-url https://pypi.org/simple && \
     pip install cmake==3.31.2 \
