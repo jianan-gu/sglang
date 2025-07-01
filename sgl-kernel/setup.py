@@ -162,7 +162,6 @@ sources = [
     "csrc/cpu/moe_int8.cpp",
     "csrc/cpu/moe_int4_w4a16.cpp",
     "csrc/cpu/norm.cpp",
-    "csrc/cpu/numa_utils.cpp",
     "csrc/cpu/qkv_proj.cpp",
     "csrc/cpu/rope.cpp",
     "csrc/cpu/topk.cpp",
