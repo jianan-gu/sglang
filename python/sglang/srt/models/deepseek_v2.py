@@ -105,6 +105,8 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 
+enable_cpu_moe_in_xpu = bool(int(os.getenv("ENABLE_CPU_MOE_IN_XPU", "0")))
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -282,25 +284,31 @@ class DeepseekV2MoE(nn.Module):
                 num_gpu_experts=global_server_args_dict["ep_moe_heto_gpu_experts"]
             )
 
-        self.experts = get_moe_impl_class()(
-            num_experts=config.n_routed_experts
-            + self.num_fused_shared_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            layer_id=self.layer_id,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            prefix=add_prefix("experts", prefix),
-            **additional_config,
-        )
+        orig_device = self.gate.weight.device
+        moe_device = orig_device
+        if enable_cpu_moe_in_xpu:
+            moe_device = torch.device("cpu")
+
+        with moe_device:
+            self.experts = get_moe_impl_class()(
+                num_experts=config.n_routed_experts
+                + self.num_fused_shared_experts
+                + global_server_args_dict["ep_num_redundant_experts"],
+                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                renormalize=config.norm_topk_prob,
+                quant_config=quant_config,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                prefix=add_prefix("experts", prefix),
+                **additional_config,
+            )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -389,6 +397,9 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
         ):
             return self.forward_cpu(hidden_states)
+        
+        if enable_cpu_moe_in_xpu:
+            return self.forward_cpu(hidden_states)
 
         router_logits = self.gate(hidden_states)
         if global_server_args_dict["enable_ep_moe_heto"]:
@@ -415,54 +426,59 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if enable_cpu_moe_in_xpu:
+            shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         fused_experts_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        assert getattr(
-            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
-        ) == getattr(self.shared_experts.down_proj, "use_intel_amx_backend", False)
-        # [Note] inplace should be False in fused_experts.
-        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
-        # While hidden_states is still needed in shared_expert.
-        final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
-            hidden_states,
-            self.shared_experts.gate_up_proj.weight,
-            self.shared_experts.down_proj.weight,
-            fused_experts_out,
-            self.routed_scaling_factor,
-            True,  # inplace
-            self.shared_experts_is_int8,  # use_int8_w8a8
-            self.shared_experts_is_fp8,  # use_fp8_w8a16
-            (
-                self.shared_experts.gate_up_proj.weight_scale
-                if self.shared_experts_is_int8
-                else (
-                    self.shared_experts.gate_up_proj.weight_scale_inv
+        if enable_cpu_moe_in_xpu:
+            final_hidden_states = fused_experts_out + shared_output
+        else:
+            assert getattr(
+                self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+            ) == getattr(self.shared_experts.down_proj, "use_intel_amx_backend", False)
+            # [Note] inplace should be False in fused_experts.
+            # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
+            # While hidden_states is still needed in shared_expert.
+            final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
+                hidden_states,
+                self.shared_experts.gate_up_proj.weight,
+                self.shared_experts.down_proj.weight,
+                fused_experts_out,
+                self.routed_scaling_factor,
+                True,  # inplace
+                self.shared_experts_is_int8,  # use_int8_w8a8
+                self.shared_experts_is_fp8,  # use_fp8_w8a16
+                (
+                    self.shared_experts.gate_up_proj.weight_scale
+                    if self.shared_experts_is_int8
+                    else (
+                        self.shared_experts.gate_up_proj.weight_scale_inv
+                        if self.shared_experts_is_fp8
+                        else None
+                    )
+                ),  # w1_scale
+                (
+                    self.shared_experts.down_proj.weight_scale
+                    if self.shared_experts_is_int8
+                    else (
+                        self.shared_experts.down_proj.weight_scale_inv
+                        if self.shared_experts_is_fp8
+                        else None
+                    )
+                ),  # w2_scale
+                (
+                    self.shared_experts_weight_block_size
                     if self.shared_experts_is_fp8
                     else None
-                )
-            ),  # w1_scale
-            (
-                self.shared_experts.down_proj.weight_scale
-                if self.shared_experts_is_int8
-                else (
-                    self.shared_experts.down_proj.weight_scale_inv
-                    if self.shared_experts_is_fp8
-                    else None
-                )
-            ),  # w2_scale
-            (
-                self.shared_experts_weight_block_size
-                if self.shared_experts_is_fp8
-                else None
-            ),  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
-            True,  # is_vnni
-        )
+                ),  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
