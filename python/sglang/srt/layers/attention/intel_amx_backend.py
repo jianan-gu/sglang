@@ -183,6 +183,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
         """
 
+        q_head = query.shape[1]
+        k_head = k_cache.shape[1]
+        repeat_num = q_head // k_head if q_head > k_head else 1
+
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
@@ -210,9 +214,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             per_req_out = (
                 scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
+                    per_req_key.unsqueeze(0).repeat(1, repeat_num, 1, 1),
+                    per_req_value.unsqueeze(0).repeat(1, repeat_num, 1, 1),
                     scale=scaling,
                     is_causal=causal,
                 )
