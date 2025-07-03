@@ -13,6 +13,9 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+import os
+
+ENABLE_KV_CACHE_UPDATE = os.getenv("ENABLE_KV_CACHE_UPDATE", "0") == "1"
 
 
 class IntelAMXAttnBackend(AttentionBackend):
@@ -31,16 +34,18 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention
         self.extend_attention_fwd = extend_attention
-        max_bs = model_runner.req_to_token_pool.size
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token.clone()
-        self.kv_indptr = [
-            torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-            ), # encoder
-            torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-            ), # decoder
-        ]
+        if ENABLE_KV_CACHE_UPDATE:
+            max_bs = model_runner.req_to_token_pool.size
+            self.req_to_token = model_runner.req_to_token_pool.req_to_token.clone()
+            self.kv_indptr = [
+                torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                ),  # encoder
+                torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                ),  # decoder
+            ]
+            self.saved_kv = {"k_cache": {}, "v_cache": {}}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -163,7 +168,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
-        kv_indices=None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -183,10 +187,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
         """
 
-        q_head = query.shape[1]
-        k_head = k_cache.shape[1]
-        repeat_num = q_head // k_head if q_head > k_head else 1
-
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
@@ -204,18 +204,11 @@ class IntelAMXAttnBackend(AttentionBackend):
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
-            if kv_indices is not None:
-                per_req_tokens = kv_indices
-            else:
-                req_pool_idx = req_pool_indices[seq_idx]
-                per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_out = (
                 scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
-                    per_req_key.unsqueeze(0).repeat(1, repeat_num, 1, 1),
-                    per_req_value.unsqueeze(0).repeat(1, repeat_num, 1, 1),
+                    k_cache,
+                    v_cache,
                     scale=scaling,
                     is_causal=causal,
                 )
@@ -226,7 +219,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             start_q, start_kv = end_q, end_kv
 
         return output
-    
+
     def update_kv_indices_encode(
         self,
         forward_batch: ForwardBatch,
@@ -269,19 +262,18 @@ class IntelAMXAttnBackend(AttentionBackend):
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
                 spec_info, EagleVerifyInput
             )
-            kv_indices, kv_indptr, _, _ = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    req_to_token,
-                )
+            kv_indices, kv_indptr, _, _ = spec_info.generate_attn_arg_prefill(
+                req_pool_indices,
+                paged_kernel_lens,
+                paged_kernel_lens_sum,
+                req_to_token,
             )
         for i in range(bs):
             req_pool_index = req_pool_indices[i]
-            self.req_to_token[req_pool_index, :kv_indptr[-1]] = kv_indices[:kv_indptr[-1]]
-        return kv_indices[:kv_indptr[-1]]
-
+            self.req_to_token[req_pool_index, : kv_indptr[-1]] = kv_indices[
+                : kv_indptr[-1]
+            ]
+        return kv_indices[: kv_indptr[-1]]
 
     def update_kv_indices_decode(
         self,
@@ -320,8 +312,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             bs = kv_indptr.shape[0] - 1
         for i in range(bs):
             req_pool_index = req_pool_indices[i].item()
-            self.req_to_token[req_pool_index, :kv_indptr[-1]] = kv_indices[:kv_indptr[-1]]
-        return kv_indices[:kv_indptr[-1]]
+            self.req_to_token[req_pool_index, : kv_indptr[-1]] = kv_indices[
+                : kv_indptr[-1]
+            ]
+        return kv_indices[: kv_indptr[-1]]
 
     def forward_extend(
         self,
@@ -332,7 +326,13 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        kv_indices = self.update_kv_indices_encode(forward_batch, layer.is_cross_attention)
+        if ENABLE_KV_CACHE_UPDATE:
+            kv_indices = self.update_kv_indices_encode(
+                forward_batch, layer.is_cross_attention
+            )
+            req_to_token = self.req_to_token
+        else:
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -345,9 +345,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         if save_kv_cache:
             if k is not None:
                 assert v is not None
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v
-                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         _, max_extend_len = self.forward_metadata
         if k is not None:
@@ -359,7 +357,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.req_to_token,
+                req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.extend_seq_lens,
@@ -369,6 +367,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 layer.logit_cap,
             )
         else:
+            assert ENABLE_KV_CACHE_UPDATE
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
             q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -379,7 +378,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 o_,
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.req_to_token,
+                req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.extend_prefix_lens,
@@ -401,7 +400,13 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        kv_indices = self.update_kv_indices_decode(forward_batch, layer.is_cross_attention)
+        if ENABLE_KV_CACHE_UPDATE:
+            kv_indices = self.update_kv_indices_decode(
+                forward_batch, layer.is_cross_attention
+            )
+            req_to_token = self.req_to_token
+        else:
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
         attn_logits, _ = self.forward_metadata
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -410,7 +415,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-        
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -426,7 +431,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 k,
                 v,
                 cache_loc.to(torch.int),
-                self.req_to_token,
+                req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 attn_logits,
@@ -434,30 +439,110 @@ class IntelAMXAttnBackend(AttentionBackend):
                 layer.logit_cap,
             )
         else:
+            assert ENABLE_KV_CACHE_UPDATE
             if save_kv_cache:
                 if k is not None:
                     assert v is not None
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v
-                    )
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
             q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-
+            kv_indices_start = kv_indices[0].item()
+            kv_indices_end = kv_indices[-1].item()
+            if layer.layer_id not in self.saved_kv["k_cache"]:
+                repeat_num = (
+                    layer.tp_q_head_num // layer.tp_k_head_num
+                    if layer.tp_q_head_num > layer.tp_k_head_num
+                    else 1
+                )
+                self.saved_kv["k_cache"][layer.layer_id] = {
+                    kv_indices_start: {
+                        kv_indices_end: forward_batch.token_to_kv_pool.get_key_buffer(
+                            layer.layer_id
+                        )[kv_indices]
+                        .movedim(0, q_.dim() - 2)
+                        .unsqueeze(0)
+                        .repeat(1, repeat_num, 1, 1),
+                    }
+                }
+                self.saved_kv["v_cache"][layer.layer_id] = {
+                    kv_indices_start: {
+                        kv_indices_end: forward_batch.token_to_kv_pool.get_value_buffer(
+                            layer.layer_id
+                        )[kv_indices]
+                        .movedim(0, q_.dim() - 2)
+                        .unsqueeze(0)
+                        .repeat(1, repeat_num, 1, 1),
+                    }
+                }
+            elif kv_indices_start not in self.saved_kv["k_cache"][layer.layer_id]:
+                repeat_num = (
+                    layer.tp_q_head_num // layer.tp_k_head_num
+                    if layer.tp_q_head_num > layer.tp_k_head_num
+                    else 1
+                )
+                self.saved_kv["k_cache"][layer.layer_id][kv_indices_start] = {
+                    kv_indices_end: forward_batch.token_to_kv_pool.get_key_buffer(
+                        layer.layer_id
+                    )[kv_indices]
+                    .movedim(0, q_.dim() - 2)
+                    .unsqueeze(0)
+                    .repeat(1, repeat_num, 1, 1),
+                }
+                self.saved_kv["v_cache"][layer.layer_id][kv_indices_start] = {
+                    kv_indices_end: forward_batch.token_to_kv_pool.get_value_buffer(
+                        layer.layer_id
+                    )[kv_indices]
+                    .movedim(0, q_.dim() - 2)
+                    .unsqueeze(0)
+                    .repeat(1, repeat_num, 1, 1),
+                }
+            elif (
+                kv_indices_end
+                not in self.saved_kv["k_cache"][layer.layer_id][kv_indices_start]
+            ):
+                repeat_num = (
+                    layer.tp_q_head_num // layer.tp_k_head_num
+                    if layer.tp_q_head_num > layer.tp_k_head_num
+                    else 1
+                )
+                self.saved_kv["k_cache"][layer.layer_id][kv_indices_start][
+                    kv_indices_end
+                ] = (
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)[
+                        kv_indices
+                    ]
+                    .movedim(0, q_.dim() - 2)
+                    .unsqueeze(0)
+                    .repeat(1, repeat_num, 1, 1)
+                )
+                self.saved_kv["v_cache"][layer.layer_id][kv_indices_start][
+                    kv_indices_end
+                ] = (
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)[
+                        kv_indices
+                    ]
+                    .movedim(0, q_.dim() - 2)
+                    .unsqueeze(0)
+                    .repeat(1, repeat_num, 1, 1)
+                )
             self._run_sdpa_forward_decode(
                 q_,
                 o_,
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.req_to_token,
+                self.saved_kv["k_cache"][layer.layer_id][kv_indices_start][
+                    kv_indices_end
+                ],
+                self.saved_kv["v_cache"][layer.layer_id][kv_indices_start][
+                    kv_indices_end
+                ],
+                req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 scaling=layer.scaling,
                 enable_gqa=use_gqa,
                 causal=False,
-                kv_indices=kv_indices,
             )
 
         return o
