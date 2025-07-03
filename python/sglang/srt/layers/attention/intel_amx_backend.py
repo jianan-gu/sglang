@@ -15,7 +15,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 import os
 
-ENABLE_KV_CACHE_UPDATE = os.getenv("ENABLE_KV_CACHE_UPDATE", "0") == "1"
+ENABLE_LLAMA11B_KV_CACHE_UPDATE = (
+    os.getenv("ENABLE_LLAMA11B_KV_CACHE_UPDATE", "0") == "1"
+)
 
 
 class IntelAMXAttnBackend(AttentionBackend):
@@ -34,7 +36,7 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention
         self.extend_attention_fwd = extend_attention
-        if ENABLE_KV_CACHE_UPDATE:
+        if ENABLE_LLAMA11B_KV_CACHE_UPDATE:
             max_bs = model_runner.req_to_token_pool.size
             self.req_to_token = model_runner.req_to_token_pool.req_to_token.clone()
             self.kv_indptr = [
@@ -326,7 +328,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        if ENABLE_KV_CACHE_UPDATE:
+        if ENABLE_LLAMA11B_KV_CACHE_UPDATE:
             kv_indices = self.update_kv_indices_encode(
                 forward_batch, layer.is_cross_attention
             )
@@ -367,7 +369,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 layer.logit_cap,
             )
         else:
-            assert ENABLE_KV_CACHE_UPDATE
+            assert ENABLE_LLAMA11B_KV_CACHE_UPDATE
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
             q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -400,7 +402,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        if ENABLE_KV_CACHE_UPDATE:
+        if ENABLE_LLAMA11B_KV_CACHE_UPDATE:
             kv_indices = self.update_kv_indices_decode(
                 forward_batch, layer.is_cross_attention
             )
@@ -439,7 +441,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 layer.logit_cap,
             )
         else:
-            assert ENABLE_KV_CACHE_UPDATE
+            assert ENABLE_LLAMA11B_KV_CACHE_UPDATE
             if save_kv_cache:
                 if k is not None:
                     assert v is not None
