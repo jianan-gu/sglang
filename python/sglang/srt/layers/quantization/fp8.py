@@ -97,6 +97,8 @@ enable_esimd_opt = bool(int(os.getenv("ENABLE_ESIMD_FP8_GEMM_OPT", "0")))
 if enable_esimd_opt:
     from sgl_kernel_esimd import esimd_kernel_uni
 
+enable_cpu_moe_in_xpu = bool(int(os.getenv("ENABLE_CPU_MOE_IN_XPU", "0")))
+
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
@@ -860,6 +862,16 @@ class Fp8MoEMethod:
                     layer.w2_weight.contiguous(), (16, 16)
                 )
 
+            # YC WA
+            if enable_cpu_moe_in_xpu:
+                if not (layer.w13_weight_scale_inv.device == torch.device("cpu") and \
+                    layer.w2_weight_scale_inv.device == torch.device("cpu") and \
+                    layer.w13_weight.device == torch.device("cpu") and \
+                    layer.w2_weight.device == torch.device("cpu")):
+                    raise ValueError("MOE weights must be on cpu!!!")
+
+                print("checking MOE weight is in cpu and will shuffle!")
+
             if all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
                 assert (
                     cpu_has_amx_support()
@@ -1090,6 +1102,27 @@ class Fp8MoEMethod:
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
+
+        if enable_cpu_moe_in_xpu:
+            ori_device = x.device
+            ori_type = x.dtype
+            cpuout = torch.ops.sgl_kernel.fused_experts_cpu(
+                    x.cpu().to(torch.bfloat16),
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights.cpu(),
+                    topk_ids.cpu(),
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    False,  # use_int8_w8a8
+                    True,  # use_fp8_w8a16
+                    layer.w13_weight_scale_inv,  # w1_scale
+                    layer.w2_weight_scale_inv,  # w2_scale
+                    self.quant_config.weight_block_size,  # block_size
+                    None,  # a1_scale
+                    None,  # a2_scale
+                    True,  # is_vnni
+                )
+            return cpuout.to(ori_type).to(ori_device)
 
         if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.fused_experts_cpu(
