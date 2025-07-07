@@ -1306,8 +1306,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
         else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
+            # q = torch.cat([q_nope_out, q_pe], dim=-1)
+            # k = torch.cat([k_nope, k_pe], dim=-1)
+            if not hasattr(self, "q_tmp") or self.q_tmp.shape[0] != q_nope_out.shape[0]:
+                self.q_tmp = torch.empty(q_nope_out.shape[0], q_nope_out.shape[1], self.kv_lora_rank + self.qk_rope_head_dim,  device=q_nope_out.device, dtype=q_nope_out.dtype)
+                self.k_tmp = torch.empty(k_nope.shape[0], 1, self.kv_lora_rank + self.qk_rope_head_dim,  device=q_nope_out.device, dtype=q_nope_out.dtype)
+            q = self.q_tmp
+            k = self.k_tmp
+            q[:,:,:self.kv_lora_rank] = q_nope_out
+            k[:,:,:self.kv_lora_rank] = k_nope
+            q[:,:,self.kv_lora_rank:] = q_pe
+            k[:,:,self.kv_lora_rank:] = k_pe
             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

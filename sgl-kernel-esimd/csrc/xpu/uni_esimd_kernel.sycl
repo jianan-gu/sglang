@@ -14,6 +14,7 @@
 #include "esimd_kernels/fp8_GEMV.h"
 #include "esimd_kernels/sdpa_norm.h"
 #include "esimd_kernels/rmsNorm.h"
+#include "esimd_kernels/rotary_pos_emb.h"
 
 void esimd_add(uint8_t* a, uint8_t* b, uint8_t* c, int64_t len, sycl::queue& q){
     sycl::range<1> LocalRange(16); 
@@ -670,6 +671,107 @@ void esimd_grouped_topk(
 
 }
 
+void esimd_rotary_pos_emb_ds(uint8_t* qState, uint8_t* kState, uint8_t* cos_sin_cache, uint8_t* positions, uint8_t* offsets,
+ int num_heads_q, int hidden_dim_q, int hd_stride_q,
+ int num_heads_kv, int hidden_dim_kv, int hd_stride_kv, int head_hd_stride_kv, int input_len, int has_offset, sycl::queue& dpcpp_queue) {
+ 
+  // printf("input_len = %d", (int)input_len);
+  sycl::range<2> GlobalRange(input_len, num_heads_q + num_heads_kv);
+  sycl::range<2> LocalRange(1, 1);
+  sycl::nd_range<2> Range(GlobalRange, LocalRange);
+  static int callCount = 0;
+  // printf("---------- esimd_rotary_pos_emb, GlobalRange: %d, %d ----------\n", num_heads_q + num_heads_kv, 1 );
+  // currently only support hidden_dim_q and hidden_dim_kv 64
+ 
+  sycl::event e;
+  try {
+    e = dpcpp_queue.submit([&](handler& cgh) {
+        cgh.parallel_for(Range, [=](nd_item<2> ndi) SYCL_ESIMD_KERNEL{
+          rotary_pos_emb_ds(qState, kState, cos_sin_cache, positions, offsets, 
+            num_heads_q, hidden_dim_q, hd_stride_q, num_heads_kv, hidden_dim_kv, hd_stride_kv, head_hd_stride_kv, has_offset, ndi);
+      });
+    });
+  } catch (sycl::exception const &e) {
+    std::cout << "SYCL exception caught: " << e.what() << '\n';
+    return;
+  }
+ 
+}
+
+
+ void esimd_updateKV_indexed(
+  uint8_t* kv_cache, uint8_t* loc, uint8_t* kv_input,
+  int64_t kv_hd,
+  int64_t kv_stride,
+  int64_t update_len,
+
+  sycl::queue& dpcpp_queue)
+{
+  // only support one kv head for MLA
+
+  // int n_threads = (kv_hd + 127) / 128;
+  // int hd_last_thread = kv_hd % 128;
+  // if (hd_last_thread == 0) hd_last_thread = 128;
+
+  constexpr int n_threads = 5;
+  constexpr int hd_last_thread = 64;
+
+  sycl::range<1> GlobalRange(update_len*n_threads);
+  sycl::range<1> LocalRange(n_threads);
+  sycl::nd_range<1> Range(GlobalRange, LocalRange);
+
+  dpcpp_queue.submit([&](handler& cgh) {
+    cgh.parallel_for(
+      Range, [=](nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+
+        int h = ndi.get_group(0);
+        int hh = ndi.get_local_id(0);
+
+        uint64_t outh = ((uint64_t*)loc)[h];
+
+        simd<fp16, 128> input;
+
+        if (hh != (n_threads-1))
+        {
+          input.template bit_cast_view<uint8_t>().template select<256, 1>(0) =
+            __ESIMD_ENS::lsc_block_load<
+            uint8_t,
+            256,
+            __ESIMD_ENS::lsc_data_size::default_size,
+            __ESIMD_ENS::cache_hint::cached,
+            __ESIMD_ENS::cache_hint::cached>((uint8_t*)kv_input + (h * kv_stride + hh * 128) * sizeof(fp16));
+
+          __ESIMD_ENS::lsc_block_store<
+            fp16,
+            128,
+            __ESIMD_ENS::lsc_data_size::default_size,
+            __ESIMD_ENS::cache_hint::write_back,
+            __ESIMD_ENS::cache_hint::write_back>((fp16*)kv_cache + outh * kv_hd + hh * 128, input.select<128, 1>(0));
+        }
+        else
+        {
+          input.template bit_cast_view<uint8_t>().template select<128, 1>(0) =
+            __ESIMD_ENS::lsc_block_load<
+            uint8_t,
+            128,
+            __ESIMD_ENS::lsc_data_size::default_size,
+            __ESIMD_ENS::cache_hint::cached,
+            __ESIMD_ENS::cache_hint::cached>((uint8_t*)kv_input + (h * kv_stride + hh * 128) * sizeof(fp16));
+
+          __ESIMD_ENS::lsc_block_store<
+            fp16,
+            64,
+            __ESIMD_ENS::lsc_data_size::default_size,
+            __ESIMD_ENS::cache_hint::write_back,
+            __ESIMD_ENS::cache_hint::write_back>((fp16*)kv_cache + outh * kv_hd + hh * 128, input.select<64, 1>(0));
+        }
+      
+      });
+  });
+
+
+}
+
 at::Tensor esimd_kernel_uni(
     at::Tensor _p0,
     at::Tensor _p1,
@@ -734,6 +836,12 @@ at::Tensor esimd_kernel_uni(
         break;
         case 1110:
           esimd_grouped_topk(p0, p1, p2, p3, p4, p5, i1, i2, i3, i4, i5, f0, dpcpp_queue);
+        break;
+        case 1111:
+          esimd_rotary_pos_emb_ds(p0, p1, p2, p3, p4, i1, i2, i3, i4, i5, i6, i7, i8, i9, dpcpp_queue);
+        break;
+        case 1112:
+          esimd_updateKV_indexed(p0, p1, p2, i1, i2, i3, dpcpp_queue);
         break;
         default:
           printf("---------- esimd kernel op not supported, op is %lld ----------\n", i0);
