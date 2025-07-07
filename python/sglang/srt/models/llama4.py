@@ -128,7 +128,7 @@ class Llama4MoE(nn.Module):
             reduce_results=False,  # We need to do scatter before reduce
         )
         self.shared_experts_is_int8 = False
-        if self.shared_expert.gate_up_proj.weight.dtype == torch.int8:
+        if hasattr(self.shared_expert.gate_up_proj, "weight") and self.shared_expert.gate_up_proj.weight.dtype == torch.int8:
             self.shared_experts_is_int8 = True
         self.use_intel_amx_backend =  cpu_has_amx_support()
         self.sgl_kernel_cpu_shared_expert = sgl_kernel.cpu.shared_expert
