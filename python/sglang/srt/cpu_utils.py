@@ -83,7 +83,7 @@ def update_config(
         total_kv_heads = model_config.get_total_num_kv_heads()
 
         # TODO make general awq padding for TP3
-        num_key_value_heads = 12 if tp_size == 3 and quant_method == "awq" else pad_vocab_size(total_kv_heads, tp_size)
+        num_key_value_heads = 12 if tp_size == 3 and (quant_method == "awq" or quant_method == "fp8") else pad_vocab_size(total_kv_heads, tp_size)
 
         model_config.num_key_value_heads = num_key_value_heads
         model_config.hf_config.num_key_value_heads = num_key_value_heads
@@ -97,6 +97,11 @@ def update_config(
     # Int4 AWQ format padding
     if hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, "quantization_config") and "group_size" in model_config.hf_config.quantization_config:
         quantization_group_size = model_config.hf_config.quantization_config["group_size"]
+        import math
+        NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) // tp_size
+        intermediate_padding_size = tp_size * NEW_MOE_PADDING_SIZE
+    elif hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, "quantization_config") and "weight_block_size" in model_config.hf_config.quantization_config:
+        quantization_group_size = model_config.hf_config.quantization_config["weight_block_size"][0]
         import math
         NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) // tp_size
         intermediate_padding_size = tp_size * NEW_MOE_PADDING_SIZE
