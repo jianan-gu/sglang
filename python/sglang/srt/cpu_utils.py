@@ -98,12 +98,12 @@ def update_config(
     if hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, "quantization_config") and "group_size" in model_config.hf_config.quantization_config:
         quantization_group_size = model_config.hf_config.quantization_config["group_size"]
         import math
-        NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) // tp_size
+        NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) #// tp_size
         intermediate_padding_size = tp_size * NEW_MOE_PADDING_SIZE
     elif hasattr(model_config, "hf_config") and hasattr(model_config.hf_config, "quantization_config") and "weight_block_size" in model_config.hf_config.quantization_config:
         quantization_group_size = model_config.hf_config.quantization_config["weight_block_size"][0]
         import math
-        NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) // tp_size
+        NEW_MOE_PADDING_SIZE = math.lcm(tp_size, quantization_group_size) #// tp_size
         intermediate_padding_size = tp_size * NEW_MOE_PADDING_SIZE
     else:
         intermediate_padding_size = tp_size * DEFAULT_MOE_PADDING_SIZE
