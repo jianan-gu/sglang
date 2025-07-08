@@ -371,7 +371,7 @@ class Int4CPUMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if SGLANG_USE_CPU_W4A8:
-            assert False, "MOE W4A8 has not implemented"
+            print("Warning: MOE W4A8 has not implemented, using W4A16 instead")
         w13_qweight, w13_qzeros, w13_scales = _autoawq_to_int4pack(
             layer.w13_qweight.data, layer.w13_qzeros.data, layer.w13_scales.data
         )
