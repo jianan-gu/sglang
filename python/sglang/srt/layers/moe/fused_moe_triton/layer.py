@@ -456,43 +456,64 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.tensor,
         tp_rank: int,
     ):
-
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
-        loaded_weight_shard_dim = loaded_weight.size(shard_dim)
-        start_idx = shard_size * tp_rank
-        actual_shard_size = get_actual_shard_size(
-            shard_size, start_idx, loaded_weight_shard_dim
-        )
-        length = shard_size - actual_shard_size
-
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, start_idx, actual_shard_size
+        tp_size = get_tensor_model_parallel_world_size()
+        full_shard_size = shard_size * tp_size
+        start_idx = tp_rank * shard_size
+        if full_shard_size > loaded_weight.size(shard_dim) and start_idx >= loaded_weight.size(shard_dim):
+            pad_size = start_idx + shard_size - loaded_weight.size(shard_dim)
+            if shard_dim == 0 or shard_dim == -2:
+                pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=shard_dim).to(loaded_weight.dtype)
+            else: #AWQ case is transpose NxK to KxN
+                pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=shard_dim).to(loaded_weight.dtype)
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, start_idx, shard_size
+                )
+            actual_shard_size = shard_size
+        else:
+            loaded_weight_shard_dim = loaded_weight.size(shard_dim)
+            start_idx = shard_size * tp_rank
+            actual_shard_size = get_actual_shard_size(
+                shard_size, start_idx, loaded_weight_shard_dim
             )
+            length = shard_size - actual_shard_size
 
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, start_idx, actual_shard_size
+                )
+            # Narrow parameter and load.
+            # w1, gate_proj: Load into first logical weight of w13.
+            if shard_id == "w1":
+                # See [Note] Reset padded weights to zero.
+                reset_param_data_if_needed(
+                    expert_data,
+                    shard_dim,
+                    actual_shard_size,
+                    length,
+                )
+            # w3, up_proj: Load into second logical weight of w13.
+            else:
+                assert shard_id == "w3"
+                # See [Note] Reset padded weights to zero.
+                reset_param_data_if_needed(
+                    expert_data,
+                    shard_dim,
+                    shard_size + actual_shard_size,
+                    length,
+                )
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
-            # See [Note] Reset padded weights to zero.
-            reset_param_data_if_needed(
-                expert_data,
-                shard_dim,
-                actual_shard_size,
-                length,
-            )
             expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            # See [Note] Reset padded weights to zero.
-            reset_param_data_if_needed(
-                expert_data,
-                shard_dim,
-                shard_size + actual_shard_size,
-                length,
-            )
             expert_data = expert_data.narrow(shard_dim, shard_size, actual_shard_size)
         expert_data.copy_(loaded_weight)
 
@@ -509,23 +530,39 @@ class FusedMoE(torch.nn.Module):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
+        tp_size = get_tensor_model_parallel_world_size()
+        full_shard_size = shard_size * tp_size
+        start_idx = tp_rank * shard_size
+        if full_shard_size > loaded_weight.size(shard_dim) and start_idx >= loaded_weight.size(shard_dim):
+            pad_size = start_idx + shard_size - loaded_weight.size(shard_dim)
+            if shard_dim == 0 or shard_dim == -2:  #AWQ case is transpose NxK to KxN
+                pad_tensor = torch.zeros(pad_size, loaded_weight.size(1)).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=shard_dim).to(loaded_weight.dtype)
+            else:
+                pad_tensor = torch.zeros(loaded_weight.size(0), pad_size).to(loaded_weight.dtype)
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=shard_dim).to(loaded_weight.dtype)
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, start_idx, shard_size
+                )
+        else:
 
-        if not self.use_presharded_weights:
-            loaded_weight_shard_dim = loaded_weight.size(shard_dim)
-            start_idx = shard_size * tp_rank
-            actual_shard_size = get_actual_shard_size(
-                shard_size, start_idx, loaded_weight_shard_dim
-            )
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, start_idx, actual_shard_size
-            )
+            if not self.use_presharded_weights:
+                loaded_weight_shard_dim = loaded_weight.size(shard_dim)
+                start_idx = shard_size * tp_rank
+                actual_shard_size = get_actual_shard_size(
+                    shard_size, start_idx, loaded_weight_shard_dim
+                )
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, start_idx, actual_shard_size
+                )
 
-        # w2, down_proj: Load into only logical weight of w2.
-        # See [Note] Reset padded weights to zero.
-        reset_param_data_if_needed(
-            expert_data, shard_dim, actual_shard_size, shard_size - actual_shard_size
-        )
-        expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
+            # w2, down_proj: Load into only logical weight of w2.
+            # See [Note] Reset padded weights to zero.
+            reset_param_data_if_needed(
+                expert_data, shard_dim, actual_shard_size, shard_size - actual_shard_size
+            )
+            expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(
