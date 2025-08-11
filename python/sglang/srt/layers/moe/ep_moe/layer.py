@@ -872,16 +872,6 @@ class EPMoESparseCPUInfer(EPMoESparseCPUInterface):
             raise ValueError(f"Unknown weight: {weight_name}")
 
         super().weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
-        weight_key = (
-            expert_id,
-            shard_id,
-            "weight_scale_inv" if "scale_inv" in weight_name else "weight",
-        )
-        if weight_key in self.expected_weights_set:
-            self.expected_weights_set.remove(weight_key)
-            if len(self.expected_weights_set) == 0:
-                # all weights are loaded, so we can set weights to CPU
-                self._create_cpu_moe_engine()
 
     def _create_cpu_moe_engine(self):
         if self.cpu_moe_engine is not None:

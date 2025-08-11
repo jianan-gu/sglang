@@ -104,6 +104,11 @@ from sglang.srt.utils import (
     is_xpu,
     log_info_on_rank0,
 )
+import gc
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -2344,281 +2349,344 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+    def proecess_set_weights(self, is_nextn=False, weight_names=None):
+        """优化的proecess_set_weights - 串行处理避免内存竞争"""
+        logger.info("Post-processing weights for MoE layers...")
+        def setup_layer(layer):
+            start = time.time()
+            if layer.mlp.experts.cpu_moe.cpu_moe_engine is not None:
+                return
+            logger.info(f"Setting up CPU MoE engine for layer {layer.layer_id}")
+            moe_layer = layer.mlp.experts.cpu_moe
+            # 每层处理前清理内存
+            gc.collect()
+            # 初始化MoE引擎
+            moe_layer.cpu_moe_engine = moe_layer.cpu_engine.moe.MOE(
+                moe_layer.cpu_engine.moe.MOEConfig(*moe_layer.moe_config)
+            )
+            # 直接使用权重指针
+            with torch.no_grad():
+                moe_layer.cpu_moe_engine.set_weights(
+                    moe_layer.w13_weight.data.data_ptr(),
+                    moe_layer.w2_weight.data.data_ptr(),
+                    moe_layer.w13_weight_scale_inv.data.data_ptr(),
+                    moe_layer.w2_weight_scale_inv.data.data_ptr(),
+                    moe_layer.dummy_correction_bias.data.data_ptr(),
+                )
+            # 立即删除权重，释放内存
+            del moe_layer.w13_weight
+            del moe_layer.w2_weight
+            del moe_layer.w13_weight_scale_inv
+            del moe_layer.w2_weight_scale_inv
+            del moe_layer.dummy_correction_bias
+            # 每层处理后立即垃圾回收
+            gc.collect()
+            end = time.time()
+            print(f"[LAYER {layer.layer_id}] set_weights time: {end - start:.2f}s")
 
+        seting_start_time = time.time()
+        start_layer = self.config.first_k_dense_replace
+        end_layer = self.config.num_hidden_layers
+        freq = self.config.moe_layer_freq
+        moe_layer_ids = list(range(start_layer, end_layer, freq))
+        
+        # 完全串行处理，避免内存竞争
+        for layer_id in tqdm(moe_layer_ids, desc="Setting Weights"):
+            setup_layer(self.model.layers[layer_id])
+            
+            # 每5层清理一次CUDA缓存
+            if (layer_id + 1) % 5 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # 最后统一清理
+        gc.collect()
+        
+        seting_finish_time = time.time()
+        logger.info("Finished post-processing all MoE layers.")
+        print(f"Finished post-processing all MoE layers time: {seting_finish_time - seting_start_time:.2f}s")
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-
+        """优化后的权重加载方法，减少重复计算和内存开销"""
+        load_start_time = time.time()
+        # === 预计算和缓存常用变量 ===
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
                 nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
+                    0 if self.config.num_hidden_layers == 1 
                     else self.config.num_hidden_layers
                 )
+                nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+                nextn_spec_weight_names = [
+                    "shared_head.norm", "eh_proj", "enorm", "hnorm"
+                ]
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-            weights_list = list(weights)
-            weights_dict = dict(weights_list)
-            if self.quant_config is not None:
-                if self.quant_config.get_name() == "w8a8_int8":
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale",
-                        "up_proj.weight",
-                        "up_proj.weight_scale",
-                    ]
-                elif (
-                    self.quant_config.get_name() == "fp8"
-                    or self.quant_config.get_name() == "blockwise_int8"
-                ):
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale_inv",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale_inv",
-                        "up_proj.weight",
-                        "up_proj.weight_scale_inv",
-                    ]
-                elif self.quant_config.get_name() == "awq":
-                    suffix_list = [
-                        "down_proj.qweight",
-                        "down_proj.qzeros",
-                        "down_proj.scales",
-                        "gate_proj.qweight",
-                        "gate_proj.qzeros",
-                        "gate_proj.scales",
-                        "up_proj.qweight",
-                        "up_proj.qzeros",
-                        "up_proj.scales",
-                    ]
-                elif self.quant_config.get_name() == "modelopt_fp4":
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale",
-                        "down_proj.weight_scale_2",
-                        "down_proj.input_scale",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale",
-                        "gate_proj.weight_scale_2",
-                        "gate_proj.input_scale",
-                        "up_proj.weight",
-                        "up_proj.weight_scale",
-                        "up_proj.weight_scale_2",
-                        "up_proj.input_scale",
-                    ]
-                else:
-                    raise ValueError(
-                        f"Unsupported shared expert fusion for quantization: {self.quant_config.get_name()}."
-                    )
-            else:
-                suffix_list = [
-                    "down_proj.weight",
-                    "gate_proj.weight",
-                    "up_proj.weight",
-                ]
-            names_to_remove = []
-
-            moe_layers = (
-                range(
-                    self.config.first_k_dense_replace,
-                    self.config.num_hidden_layers,
-                    self.config.moe_layer_freq,
-                )
-                if not is_nextn
-                else [nextn_layer_id]
-            )
-
-            for moe_layer in tqdm(
-                moe_layers,
-                desc=f"Cloning {self.num_fused_shared_experts} "
-                "shared expert into MoE",
-            ):
-                for suffix in suffix_list:
-                    shared_expert_weight_name = (
-                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                    )
-                    weights_list.append(
-                        (
-                            f"model.layers.{moe_layer}."
-                            f"mlp.experts."
-                            f"{self.config.n_routed_experts + 0}"
-                            f".{suffix}",
-                            weights_dict[shared_expert_weight_name],
-                        )
-                    )
-                    names_to_remove += [shared_expert_weight_name]
-            weights = [w for w in weights_list if w[0] not in names_to_remove]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
-
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
-
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
-
+        # === 预构建映射字典，避免重复查找 ===
+        stacked_params_mapping = {
+            "gate_proj": ("gate_up_proj", 0),
+            "up_proj": ("gate_up_proj", 1),
+        }
+        # === 一次性获取所有参数，避免重复调用 ===
         params_dict = dict(self.named_parameters())
-        weight_names = []
-        for name, loaded_weight in weights:
-            weight_names.append(name)
+        
+        # === 预计算专家参数映射 ===
+        expert_params_mapping_dict = {}
+        if hasattr(self, 'config') and hasattr(self.config, 'n_routed_experts'):
+            expert_params_list = get_moe_impl_class().make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj", 
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+            )
+            # 转换为字典以加快查找
+            for param_name, weight_name, expert_id, shard_id in expert_params_list:
+                expert_params_mapping_dict[weight_name] = (param_name, expert_id, shard_id)
 
-            if not is_nextn:
+        # === 共享专家融合优化 ===
+        if self.num_fused_shared_experts > 0:
+            weights = self._optimize_shared_expert_fusion(weights, is_nextn, nextn_layer_id if is_nextn else None)
+
+        # === QKV融合相关预计算 ===
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (self.config.q_lora_rank is not None)
+        cached_a_proj = {} if fuse_qkv_a_proj else None
+        
+        # === 预编译正则表达式和字符串操作 ===
+        skip_patterns = {"rotary_emb.inv_freq"}
+        
+        # === 批量处理权重 ===
+        processed_weights = []
+        weight_names = []  # 收集权重名称用于post_load_weights
+        
+        for name, loaded_weight in weights:
+            weight_names.append(name)  # 收集所有权重名称
+            
+            # 早期过滤，避免不必要的处理
+            if any(pattern in name for pattern in skip_patterns):
+                continue
+                
+            original_name = name
+            
+            # === nextn 相关过滤和名称转换 ===
+            if is_nextn:
+                if not name.startswith(nextn_layer_prefix):
+                    continue
+                if "shared_head.head" in name or "embed_tokens" in name:
+                    continue
+                    
+                # nextn 名称转换
+                name = self._transform_nextn_name(name, nextn_layer_prefix, nextn_spec_weight_names)
+            else:
+                # 非nextn模式的过滤
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
                     if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
+                        name_parts = name.split(".")
+                        if (len(name_parts) >= 3 and 
+                            int(name_parts[2]) >= self.config.num_hidden_layers):
                             continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
-
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
-                    ):
-                        cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = (
-                            name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                        )
-                        kv_a_proj_name = (
-                            name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        )
-
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                        if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
-                        ):
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
-                            )
-                            param_name = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                                if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                                )
-                            )
-                            param = params_dict[param_name]
-
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
-                    else:
-                        if (
-                            "k_scale" in name or "v_scale" in name
-                        ) and name not in params_dict:
-                            # modelopt attn kv scale is named differently
-                            if any(scale in name for scale in ["k_scale", "v_scale"]):
-                                name = name.replace("_proj", "attn_mqa")
-                            else:
-                                logger.warning(
-                                    f"Unknown scale found in checkpoint: {name}"
-                                )
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-
+            
+            processed_weights.append((original_name, name, loaded_weight))
+        
+        # === 并行处理权重加载 ===
+        self._load_weights_batch(
+            processed_weights, 
+            params_dict,
+            stacked_params_mapping,
+            expert_params_mapping_dict,
+            cached_a_proj,
+            fuse_qkv_a_proj
+        )
+        load_finis_time = time.time()
+        print(f"Finished Loading time: {load_finis_time - load_start_time:.2f}s")
+        load_start_time = time.time()
+        self.proecess_set_weights(is_nextn=is_nextn, weight_names=weight_names)
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        load_finis_time = time.time()
+        print(f"Finishedproecess_set_weights time: {load_finis_time - load_start_time:.2f}s")
+        
+    def _optimize_shared_expert_fusion(self, weights, is_nextn, nextn_layer_id):
+        """优化共享专家融合过程"""
+        assert self.num_fused_shared_experts == 1
+        
+        weights_dict = dict(weights)
+        # 预计算后缀列表
+        suffix_list = self._get_quantization_suffixes()
+        # 预计算MoE层
+        moe_layers = (
+            range(
+                self.config.first_k_dense_replace,
+                self.config.num_hidden_layers, 
+                self.config.moe_layer_freq,
+            ) if not is_nextn else [nextn_layer_id]
+        )
+        
+        # 批量构建新权重
+        new_weights = []
+        names_to_remove = set()  # 使用set提高查找效率
+        
+        for moe_layer in moe_layers:
+            for suffix in suffix_list:
+                shared_expert_weight_name = f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                if shared_expert_weight_name in weights_dict:
+                    new_weight_name = (
+                        f"model.layers.{moe_layer}.mlp.experts."
+                        f"{self.config.n_routed_experts + 0}.{suffix}"
+                    )
+                    new_weights.append((new_weight_name, weights_dict[shared_expert_weight_name]))
+                    names_to_remove.add(shared_expert_weight_name)
+        
+        # 高效过滤权重
+        filtered_weights = [w for w in weights if w[0] not in names_to_remove]
+        filtered_weights.extend(new_weights)
+        
+        return filtered_weights
+
+    def _get_quantization_suffixes(self):
+        """获取量化后缀列表"""
+        if self.quant_config is None:
+            return ["down_proj.weight", "gate_proj.weight", "up_proj.weight"]
+        
+        quant_name = self.quant_config.get_name()
+        suffix_map = {
+            "w8a8_int8": [
+                "down_proj.weight", "down_proj.weight_scale",
+                "gate_proj.weight", "gate_proj.weight_scale", 
+                "up_proj.weight", "up_proj.weight_scale",
+            ],
+            "fp8": [
+                "down_proj.weight", "down_proj.weight_scale_inv",
+                "gate_proj.weight", "gate_proj.weight_scale_inv",
+                "up_proj.weight", "up_proj.weight_scale_inv", 
+            ],
+            "blockwise_int8": [
+                "down_proj.weight", "down_proj.weight_scale_inv",
+                "gate_proj.weight", "gate_proj.weight_scale_inv",
+                "up_proj.weight", "up_proj.weight_scale_inv",
+            ],
+            "awq": [
+                "down_proj.qweight", "down_proj.qzeros", "down_proj.scales",
+                "gate_proj.qweight", "gate_proj.qzeros", "gate_proj.scales", 
+                "up_proj.qweight", "up_proj.qzeros", "up_proj.scales",
+            ],
+            "modelopt_fp4": [
+                "down_proj.weight", "down_proj.weight_scale", "down_proj.weight_scale_2", "down_proj.input_scale",
+                "gate_proj.weight", "gate_proj.weight_scale", "gate_proj.weight_scale_2", "gate_proj.input_scale",
+                "up_proj.weight", "up_proj.weight_scale", "up_proj.weight_scale_2", "up_proj.input_scale",
+            ]
+        }
+        
+        if quant_name not in suffix_map:
+            raise ValueError(f"Unsupported shared expert fusion for quantization: {quant_name}")
+        
+        return suffix_map[quant_name]
+
+    def _transform_nextn_name(self, name, nextn_layer_prefix, nextn_spec_weight_names):
+        """转换nextn名称"""
+        is_decoder = True
+        for weight_name in nextn_spec_weight_names:
+            if weight_name in name:
+                name = name.replace(nextn_layer_prefix, "model")
+                is_decoder = False
+                break
+        
+        if is_decoder:
+            name = name.replace(nextn_layer_prefix, "model.decoder")
+        
+        return name
+
+    def _load_weights_batch(self, processed_weights, params_dict, stacked_params_mapping, 
+                        expert_params_mapping_dict, cached_a_proj, fuse_qkv_a_proj):
+        """批量加载权重"""
+        
+        for original_name, name, loaded_weight in processed_weights:
+            weight_loaded = False
+            
+            # === 1. 检查堆叠参数映射 ===
+            for weight_name, (param_name, shard_id) in stacked_params_mapping.items():
+                if weight_name in name:
+                    if ("mlp.experts." in name) and name not in params_dict:
+                        continue
+                        
+                    param_name_full = name.replace(weight_name, param_name)
+                    if param_name_full.endswith(".bias") and param_name_full not in params_dict:
+                        continue
+                        
+                    if param_name_full in params_dict:
+                        param = params_dict[param_name_full]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        weight_loaded = True
+                        break
+            
+            if weight_loaded:
+                continue
+                
+            # === 2. 检查专家参数映射 ===
+            for weight_name, (param_name, expert_id, shard_id) in expert_params_mapping_dict.items():
+                if weight_name in name:
+                    param_name_full = name.replace(weight_name, param_name)
+                    if param_name_full in params_dict:
+                        param = params_dict[param_name_full]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, param_name_full, 
+                                    shard_id=shard_id, expert_id=expert_id)
+                        weight_loaded = True
+                        break
+            
+            if weight_loaded:
+                continue
+                
+            # === 3. 处理其他情况 ===
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+                
+            # === 4. QKV融合处理 ===
+            if fuse_qkv_a_proj and ("q_a_proj" in name or "kv_a_proj_with_mqa" in name):
+                self._handle_qkv_fusion(name, loaded_weight, cached_a_proj, params_dict)
+                continue
+                
+            # === 5. 特殊scale处理 ===
+            if ("k_scale" in name or "v_scale" in name) and name not in params_dict:
+                if any(scale in name for scale in ["k_scale", "v_scale"]):
+                    name = name.replace("_proj", "attn_mqa")
+                else:
+                    logger.warning(f"Unknown scale found in checkpoint: {name}")
+            
+            # === 6. 默认加载 ===
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+    def _handle_qkv_fusion(self, name, loaded_weight, cached_a_proj, params_dict):
+        """处理QKV融合"""
+        cached_a_proj[name] = loaded_weight
+        
+        q_a_proj_name = name if "q_a_proj" in name else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+        kv_a_proj_name = name if "kv_a_proj_with_mqa" in name else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+
+        # 当两个权重都缓存后，执行融合
+        if q_a_proj_name in cached_a_proj and kv_a_proj_name in cached_a_proj:
+            q_a_proj_weight = cached_a_proj[q_a_proj_name]
+            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+            fused_weight = torch.cat([q_a_proj_weight, kv_a_proj_weight], dim=0)
+            
+            param_name = (
+                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa") if "q_a_proj" in name
+                else name.replace("kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa")
+            )
+            
+            if param_name in params_dict:
+                param = params_dict[param_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, fused_weight)
+                
+            # 清理缓存
+            cached_a_proj.pop(q_a_proj_name, None)
+            cached_a_proj.pop(kv_a_proj_name, None)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
