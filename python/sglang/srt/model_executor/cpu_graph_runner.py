@@ -128,7 +128,7 @@ def register_fake_ops():
         "fused_experts_cpu",
         "shared_expert_cpu",
         "gemma_rmsnorm_cpu",
-        "causal_conv1d_update_cpu_ori",
+        "causal_conv1d_update_cpu",
         "qwen3_next_rmsnorm_gated_cpu",
     ]:
 
@@ -342,14 +342,7 @@ def register_fake_ops():
         return mat1.new_empty(M, N, dtype=out_dtype)
 
     @torch.library.register_fake("sgl_kernel::fused_qkvzba_split_reshape_cat_cpu")
-    def _(
-        mixed_qkvz,
-        mixed_ba,
-        num_heads_qk,
-        num_heads_v,
-        head_qk,
-        head_v
-    ):
+    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
         batch = mixed_qkvz.shape[0]
         qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
         mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
@@ -358,7 +351,9 @@ def register_fake_ops():
         a = mixed_ba.new_empty(batch, num_heads_v)
         return mixed_qkv, z, b, a
 
-    @torch.library.register_fake("sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu")
+    @torch.library.register_fake(
+        "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
+    )
     def _(
         mixed_qkv,
         A_log,
@@ -367,7 +362,7 @@ def register_fake_ops():
         b,
         cache_indices,
         initial_state,
-        use_qk_l2norm_in_kernel
+        use_qk_l2norm_in_kernel,
     ):
         batch_size = mixed_qkv.shape[0]
         seq_len = 1
@@ -376,12 +371,7 @@ def register_fake_ops():
         return mixed_qkv.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
 
     @torch.library.register_fake("sgl_kernel::fma_linear")
-    def _(
-        mat1,
-        mat2,
-        bias,
-        post_mul
-    ):
+    def _(mat1, mat2, bias, post_mul):
         M = mat1.shape[0]
         N = mat2.shape[1]
         K = mat1.shape[1]
@@ -392,14 +382,7 @@ def register_fake_ops():
 
     @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
     def _(
-        query,
-        key,
-        value,
-        g,
-        beta,
-        cu_seqlens,
-        initial_state,
-        use_qk_l2norm_in_kernel
+        query, key, value, g, beta, cu_seqlens, initial_state, use_qk_l2norm_in_kernel
     ):
         output = torch.empty_like(value)
         assert initial_state is not None
@@ -416,7 +399,7 @@ def register_fake_ops():
         beta,
         cache_indices,
         initial_state,
-        use_qk_l2norm_in_kernel
+        use_qk_l2norm_in_kernel,
     ):
         batch_size = query.shape[1]
         seq_len = query.shape[0]
@@ -636,6 +619,7 @@ class CPUGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
+
         # Run and capture
         def run_once():
             # Clean intermediate result cache for DP attention
