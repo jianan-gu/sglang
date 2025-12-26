@@ -98,7 +98,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     capture_bs = server_args.cpu_graph_bs
     if capture_bs is None:
         capture_bs = (
-            list(range(1, 16)) + list(range(18, 31, 2)) + list(range(32, 81, 4))
+            list(range(1, 17)) + list(range(18, 31, 2)) + list(range(32, 81, 4))
         )
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
@@ -119,6 +119,9 @@ def register_fake_ops():
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
+        "gemma_fused_add_rmsnorm_cpu",
+        "layernorm_cpu",
+        "fused_add_layernorm_cpu",
     ]
     for op in none_return_ops:
 
@@ -134,6 +137,8 @@ def register_fake_ops():
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
         "causal_conv1d_fwd_cpu",
+        "gemma_rmsnorm_cpu",
+        "gemma3_rmsnorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
