@@ -122,7 +122,7 @@ class ModelRunnerKVCacheMixin:
             else:
                 cell_size = (
                     self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * (self.model_config.head_dim + self.model_config.v_head_dim)
+                    * (512+512) #self.model_config.head_dim + self.model_config.v_head_dim)
                     * num_layers
                     * kv_size
                 )
