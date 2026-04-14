@@ -153,7 +153,7 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config.hf_config.head_dim = (
                 model_config.hidden_size // model_config.num_attention_heads
             )
-        if hasattr(model_config.hf_config, "qk_nope_head_dim") and hasattr(
+        if hasattr(model_config.hf_config, "qk_nope_head_dim") and model_config.hf_config.qk_nope_head_dim is not None and hasattr(
             model_config.hf_config, "qk_rope_head_dim"
         ):
             model_config.hf_config.qk_head_dim = (
