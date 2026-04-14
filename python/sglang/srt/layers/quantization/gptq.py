@@ -513,18 +513,22 @@ class GPTQLinearMethod(LinearMethodBase):
             group_size = input_size
 
         self.use_shuffle = True
-        scale_and_zero_size = input_size // group_size
-        scale_and_zero_input_dim = None
-        # if (
-        #     input_size != input_size_per_partition
-        #     and self.quant_config.group_size != -1
-        # ):
-        #     if self.quant_config.desc_act:
-        #         self.use_shuffle = False
-        #     else:
-        #         # we need to partition qzeros and scales for exllama kernel
-        scale_and_zero_size = input_size_per_partition // group_size
-        scale_and_zero_input_dim = 0
+        if _is_cpu_amx_available:
+            scale_and_zero_size = input_size_per_partition // group_size
+            scale_and_zero_input_dim = 0
+        else:
+            scale_and_zero_size = input_size // group_size
+            scale_and_zero_input_dim = None
+        if (
+            input_size != input_size_per_partition
+            and self.quant_config.group_size != -1
+        ):
+            if self.quant_config.desc_act:
+                self.use_shuffle = False
+            else:
+                # we need to partition qzeros and scales for exllama kernel
+                scale_and_zero_size = input_size_per_partition // group_size
+                scale_and_zero_input_dim = 0
 
         qweight = PackedvLLMParameter(
             data=torch.empty(

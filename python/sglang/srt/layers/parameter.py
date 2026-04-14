@@ -105,12 +105,12 @@ class BasevLLMParameter(Parameter):
         # print(self.data.shape)
         # print(loaded_weight.shape)
 
-        # assert self.data.shape == loaded_weight.shape
-        # self.data.copy_(loaded_weight)
-        if self.data.size() == 2:
-            self.data[:loaded_weight.size(0), :loaded_weight.size(1)].copy_(loaded_weight)
-        else:
-            self.data[:loaded_weight.size(0)].copy_(loaded_weight)
+        assert self.data.shape == loaded_weight.shape
+        self.data.copy_(loaded_weight)
+        # if self.data.size() == 2:
+        #     self.data[:loaded_weight.size(0), :loaded_weight.size(1)].copy_(loaded_weight)
+        # else:
+        #     self.data[:loaded_weight.size(0)].copy_(loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         self._assert_and_load(loaded_weight)
