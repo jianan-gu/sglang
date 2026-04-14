@@ -52,7 +52,13 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_npu,
+    set_weight_attrs,
+)
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -77,7 +83,8 @@ logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
 _is_cpu = is_cpu()
-if _is_cpu:
+_is_cpu_amx_available = _is_cpu and cpu_has_amx_support()
+if _is_cpu_amx_available:
     from sglang.srt.layers.amx_utils import (
         CPUQuantMethod,
         _amx_process_weight_after_loading,
@@ -206,7 +213,9 @@ class GPTQConfig(QuantizationConfig):
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return (
-            [torch.half] if not (_is_npu or _is_cpu) else [torch.half, torch.bfloat16]
+            [torch.half]
+            if not (_is_npu or _is_cpu_amx_available)
+            else [torch.half, torch.bfloat16]
         )
 
     @classmethod
@@ -263,11 +272,11 @@ class GPTQConfig(QuantizationConfig):
             if isinstance(layer, LinearBase):
                 return GPTQLinearAscendMethod(self)
             return None
-        elif _is_cpu:
+        elif _is_cpu_amx_available:
             if isinstance(layer, FusedMoE):
                 return GPTQMoEIntelAMXMethod(self)
             if isinstance(layer, LinearBase):
-                return GPTQLinearIntelAMXMethod(self)
+                return GPTQLinearMethod(self)
             return None
 
         if isinstance(layer, FusedMoE):
@@ -589,18 +598,21 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        if _is_cpu:
+        if _is_cpu_amx_available:
             if self.quant_config.desc_act and not (
                 self.quant_config.true_sequential and self.quant_config.static_groups
             ):
                 raise ValueError(
                     "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
                 )
+            if self.quant_config.weight_bits != 4:
+                raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
             if self.use_v2_format:
                 raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
             _amx_process_weight_after_loading(
                 layer, ["qweight", "qzeros", "scales"], None, "gptq"
             )
+            return
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if self.use_shuffle:
@@ -618,7 +630,7 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if _is_cpu:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
                 x,
                 layer.qweight,
@@ -1612,9 +1624,10 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
             raise ValueError(
                 "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
             )
+        if self.quant_config.weight_bits != 4:
+            raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
         if self.use_v2_format:
             raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
-
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.linear import set_weight_attrs
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
@@ -1756,50 +1769,47 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            _amx_process_weight_after_loading(
-                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
-            )
-            _amx_process_weight_after_loading(
-                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
-            )
-            return
+        _amx_process_weight_after_loading(
+            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
+        )
+        _amx_process_weight_after_loading(
+            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
+        )
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
-        if _is_cpu:
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-            assert (
-                self.moe_runner_config.activation == "silu"
-            ), "Only SiLU activation is supported."
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
-            x = dispatch_output.hidden_states
-            topk_output = dispatch_output.topk_output
-            topk_weights, topk_ids, _ = topk_output
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_qweight,
-                layer.w2_qweight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUQuantMethod.INT4_W4A8,
-                layer.w13_scales,  # w1_scale
-                layer.w2_scales,  # w2_scale
-                layer.w13_qzeros,
-                layer.w2_qzeros,
-                None,  # block_size
-                None,  # w1_bias
-                None,  # w2_bias
-                None,  # alpha
-                None,  # limit
-                True,  # is_vnni
-            )
-            return StandardCombineInput(hidden_states=output)
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+        output = torch.ops.sgl_kernel.fused_experts_cpu(
+            x,
+            layer.w13_qweight,
+            layer.w2_qweight,
+            topk_weights,
+            topk_ids,
+            False,  # inplace See [Note] inplace should be False in fused_experts.
+            CPUQuantMethod.INT4_W4A8,
+            layer.w13_scales,  # w1_scale
+            layer.w2_scales,  # w2_scale
+            layer.w13_qzeros,
+            layer.w2_qzeros,
+            None,  # block_size
+            None,  # w1_bias
+            None,  # w2_bias
+            None,  # alpha
+            None,  # limit
+            True,  # is_vnni
+        )
+        return StandardCombineInput(hidden_states=output)
 
 
 # Register fake implementations for torch.compile support
