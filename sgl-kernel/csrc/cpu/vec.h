@@ -141,8 +141,8 @@ inline void transpose_16x16_32bit(__m512i* v) {
 inline __attribute__((always_inline)) __m512 _mm512_fexp_u20_ps(const __m512 values) {
   const __m512 vec_c0 = _mm512_set1_ps(0.00010703434948458272f);
   const __m512 vec_c1 = _mm512_set1_ps(0.30354260500649682f);
-  const __m512 vec_c2 = _mm512_set1_ps(-0.22433836478672356);
-  const __m512 vec_c3 = _mm512_set1_ps(-0.079204240219773236);
+  const __m512 vec_c2 = _mm512_set1_ps(-0.22433836478672356f);
+  const __m512 vec_c3 = _mm512_set1_ps(-0.079204240219773236f);
 
   const __m512 vec_exp_log2ef = _mm512_castsi512_ps(_mm512_set1_epi32(0x3fb8aa3b));  // log2(e)
 
