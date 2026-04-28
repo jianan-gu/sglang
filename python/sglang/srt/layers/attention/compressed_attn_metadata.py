@@ -9,19 +9,6 @@ from typing import Optional, Tuple
 import torch
 
 
-def _next_power_of_2(n: int) -> int:
-    """Return the smallest power of 2 >= n."""
-    if n <= 0:
-        return 1
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    return n + 1
-
-
 def _init_compressed_attn_metadata_pytorch(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -92,13 +79,13 @@ def _init_compressed_attn_metadata_pytorch(
         )  # [bs, c128_max_seq_len]
 
         # c_page_indices_vals = page_table_vals * c128_page_size + offset_in_page
-        c_page_indices_vals = page_table_vals * c128_page_size + offset_in_page.unsqueeze(0)
+        c128_page_indices_vals = page_table_vals * c128_page_size + offset_in_page.unsqueeze(0)
 
         # Mask: set to -1 where offsets >= c128_seq_lens_raw per batch
         # c128_seq_lens_raw: [bs], offsets: [c128_max_seq_len]
         valid_mask = offsets.unsqueeze(0) < c128_seq_lens_raw.unsqueeze(1)  # [bs, c128_max_seq_len]
         c128_page_indices = torch.where(
-            valid_mask, c_page_indices_vals, torch.tensor(-1, dtype=torch.int32, device=device)
+            valid_mask, c128_page_indices_vals, torch.tensor(-1, dtype=torch.int32, device=device)
         )
 
     return (
@@ -130,6 +117,33 @@ def init_compressed_metadata(
     torch.Tensor,
     Optional[torch.Tensor],
 ]:
+    """Initialize compressed attention metadata using pure PyTorch operations.
+
+    Computes compress-by-4 and compress-by-128 metadata for attention,
+    and optionally computes page indices for paged KV cache.
+
+    Args:
+        seq_lens: Sequence lengths per batch element, shape [bs].
+        positions: Current token positions per batch element, shape [bs].
+        raw_out_loc: Raw output locations per batch element, shape [bs].
+        page_table: Page table mapping for paged KV cache, shape [bs, max_pages].
+            Required when compute_page_indices is True.
+        page_size: Size of each page in the KV cache. Required when
+            compute_page_indices is True.
+        compute_page_indices: Whether to compute c128 page indices.
+
+    Returns:
+        A tuple of:
+        - c4_out_loc: Compressed-by-4 output locations, shape [bs].
+        - c4_positions: Compressed-by-4 positions (aligned to 4), shape [bs].
+        - c4_seq_lens_raw: Raw compressed-by-4 sequence lengths, shape [bs].
+        - c4_seq_lens_clamp1: Compressed-by-4 sequence lengths clamped to min 1, shape [bs].
+        - c128_out_loc: Compressed-by-128 output locations, shape [bs].
+        - c128_positions: Compressed-by-128 positions (aligned to 128), shape [bs].
+        - c128_seq_lens_clamp1: Compressed-by-128 sequence lengths clamped to min 1, shape [bs].
+        - c128_page_indices: Page indices for c128 compression, shape [bs, c128_max_seq_len],
+            or None if compute_page_indices is False.
+    """
     return _init_compressed_attn_metadata_pytorch(
         seq_lens,
         positions,
