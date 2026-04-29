@@ -34,6 +34,13 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
 
         return flash_mla.flash_mla_with_kvcache(**kwargs)
 
+    if backend == "cpu_amx":
+        # Intel CPU AMX implementation of FlashMLA's sparse FP8 decode path.
+        # See sgl-kernel/csrc/cpu/flash_mla.cpp.
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
+
+        return flash_mla_with_kvcache_cpu(**kwargs)
+
     raise NotImplementedError
 
 
