@@ -189,6 +189,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         have_attn_sink=False,
         have_topk_length=False,
         have_extra=False,
+        have_extra_topk_length=False,
         extra_topk=0,
         extra_num_blocks=0,
         invalid_ratio=0.0,
@@ -228,6 +229,11 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
             extra_indices = self._make_indices(
                 b, s_q, extra_topk, extra_total_tokens, dtype=idx_dtype
             )
+            if have_extra_topk_length:
+                lo = max(1, extra_topk // 2)
+                extra_topk_length = torch.randint(
+                    low=lo, high=extra_topk + 1, size=(b,), dtype=torch.int32
+                )
 
         sm_scale = d_qk ** -0.5
 
@@ -408,6 +414,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                         extra_topk=64,
                         extra_num_blocks=2,
                         have_topk_length=have_topk_length,
+                        have_extra_topk_length=have_extra_topk_length,
                     )
 
     def test_with_attn_sink_and_extra(self):
