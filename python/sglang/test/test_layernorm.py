@@ -7,11 +7,13 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm, rms_normalize_tri
 
 
 class TestRMSNormalizeTriton(unittest.TestCase):
+    EPS = 1e-6
+
     def test_rms_normalize_without_weight(self):
         x = torch.tensor([[1.0, 2.0, 3.0], [2.0, 0.0, 4.0]])
-        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.EPS)
 
-        out = rms_normalize_triton(x, 1e-6)
+        out = rms_normalize_triton(x, self.EPS)
 
         self.assertIs(out, x)
         self.assertTrue(torch.allclose(out, expected))
@@ -19,18 +21,20 @@ class TestRMSNormalizeTriton(unittest.TestCase):
     def test_rms_normalize_with_weight(self):
         x = torch.tensor([[1.0, 2.0, 3.0], [2.0, 0.0, 4.0]])
         weight = torch.tensor([1.0, 0.5, 2.0])
-        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * weight
+        expected = (
+            x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.EPS) * weight
+        )
 
-        out = rms_normalize_triton(x, 1e-6, weight)
+        out = rms_normalize_triton(x, self.EPS, weight)
 
         self.assertIs(out, x)
         self.assertTrue(torch.allclose(out, expected))
 
     def test_rms_normalize_non_contiguous(self):
         x = torch.tensor([[1.0, 2.0], [3.0, 4.0]]).t()
-        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.EPS)
 
-        out = rms_normalize_triton(x, 1e-6)
+        out = rms_normalize_triton(x, self.EPS)
 
         self.assertIs(out, x)
         self.assertTrue(torch.allclose(out, expected))
@@ -39,9 +43,9 @@ class TestRMSNormalizeTriton(unittest.TestCase):
     def test_rms_normalize_cuda_in_place(self):
         x = torch.tensor([[1.0, 2.0, 3.0]], device="cuda")
         data_ptr = x.data_ptr()
-        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.EPS)
 
-        out = rms_normalize_triton(x, 1e-6)
+        out = rms_normalize_triton(x, self.EPS)
 
         self.assertIs(out, x)
         self.assertEqual(out.data_ptr(), data_ptr)

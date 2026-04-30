@@ -44,7 +44,7 @@ def rms_normalize_native(
     normalized = x_f32 * torch.rsqrt(variance + eps)
 
     if weight is not None:
-        normalized = normalized * weight
+        normalized = normalized * weight.to(dtype=normalized.dtype)
 
     x.copy_(normalized.to(dtype=x.dtype))
     return x
