@@ -6,7 +6,7 @@ import torch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm, rms_normalize_triton
 
 
-class TestRMSNormalizeNative(unittest.TestCase):
+class TestRMSNormalizeTriton(unittest.TestCase):
     def test_rms_normalize_without_weight(self):
         x = torch.tensor([[1.0, 2.0, 3.0], [2.0, 0.0, 4.0]])
         expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
