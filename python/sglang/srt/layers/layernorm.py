@@ -39,16 +39,14 @@ logger = logging.getLogger(__name__)
 def rms_normalize_native(
     x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    x_flat = x.view(-1, x.shape[-1])
-
-    x_f32 = x_flat.to(torch.float32)
+    x_f32 = x.to(torch.float32)
     variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
     normalized = x_f32 * torch.rsqrt(variance + eps)
 
     if weight is not None:
         normalized = normalized * weight
 
-    x_flat.copy_(normalized.to(dtype=x.dtype))
+    x.copy_(normalized.to(dtype=x.dtype))
     return x
 
 
