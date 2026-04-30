@@ -36,6 +36,29 @@ from sglang.srt.layers.custom_op_util import register_custom_op
 logger = logging.getLogger(__name__)
 
 
+def rms_normalize_native(
+    x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    dim = x.shape[-1]
+    x_flat = x.view(-1, dim)
+
+    out = x_flat.to(torch.float32)
+    variance = out.pow(2).mean(dim=-1, keepdim=True)
+    out = out * torch.rsqrt(variance + eps)
+
+    if weight is not None:
+        out = out * weight
+
+    x_flat.copy_(out.to(dtype=x.dtype))
+    return x
+
+
+def rms_normalize_triton(
+    x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    return rms_normalize_native(x, eps, weight)
+
+
 @register_custom_op("sglang_rmsnorm")
 class RMSNorm(CustomOp):
     def __init__(
