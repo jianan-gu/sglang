@@ -55,6 +55,7 @@ def rms_normalize_native(
 def rms_normalize_triton(
     x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    """Backward-compatible entry point for the previous Triton helper."""
     return rms_normalize_native(x, eps, weight)
 
 

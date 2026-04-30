@@ -26,6 +26,18 @@ class TestRMSNormalizeTriton(unittest.TestCase):
         self.assertIs(out, x)
         self.assertTrue(torch.allclose(out, expected))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is not available")
+    def test_rms_normalize_cuda_in_place(self):
+        x = torch.tensor([[1.0, 2.0, 3.0]], device="cuda")
+        data_ptr = x.data_ptr()
+        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
+        out = rms_normalize_triton(x, 1e-6)
+
+        self.assertIs(out, x)
+        self.assertEqual(out.data_ptr(), data_ptr)
+        self.assertTrue(torch.allclose(out, expected))
+
 
 class TestRMSNorm(unittest.TestCase):
     DTYPES = [torch.half, torch.bfloat16]
