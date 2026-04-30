@@ -19,9 +19,7 @@ class TestRMSNormalizeNative(unittest.TestCase):
     def test_rms_normalize_with_weight(self):
         x = torch.tensor([[1.0, 2.0, 3.0], [2.0, 0.0, 4.0]])
         weight = torch.tensor([1.0, 0.5, 2.0])
-        expected = (
-            x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * weight
-        )
+        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * weight
 
         out = rms_normalize_triton(x, 1e-6, weight)
 
