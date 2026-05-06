@@ -132,7 +132,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         k_bf16 = (
             torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
         )
-        return k_bf16.contiguous(), k_bf16
+        k_bf16 = k_bf16.contiguous()
+        return k_bf16, k_bf16
 
     def _make_indices(
         self, b, s_q, topk, total_tokens, *, dtype=torch.int32, invalid_ratio=0.0

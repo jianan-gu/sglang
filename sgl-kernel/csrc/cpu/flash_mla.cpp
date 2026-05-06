@@ -110,7 +110,6 @@ template <int64_t LAYOUT>
 void dequantize_fp8_kvcache_impl(
     at::BFloat16* __restrict__ out,
     const uint8_t* __restrict__ fp8_storage,
-    int64_t num_blocks,
     int64_t block_size,
     int64_t active_total_tokens,
     int64_t storage_block_stride_bytes) {
@@ -218,7 +217,6 @@ at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout, int64_t ac
     dequantize_fp8_kvcache_impl<kV32FP8Sparse>(
         out.data_ptr<at::BFloat16>(),
         fp8_storage,
-        num_blocks,
         block_size,
         active_total_tokens,
         storage_block_stride_bytes);
@@ -226,7 +224,6 @@ at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout, int64_t ac
     dequantize_fp8_kvcache_impl<kModel1FP8Sparse>(
         out.data_ptr<at::BFloat16>(),
         fp8_storage,
-        num_blocks,
         block_size,
         active_total_tokens,
         storage_block_stride_bytes);
@@ -770,7 +767,7 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   const int64_t topk_main = indices.size(2);
 
   TORCH_CHECK(
-      !extra_k_cache.has_value() == !extra_indices.has_value(),
+      extra_k_cache.has_value() == extra_indices.has_value(),
       "extra_k_cache and extra_indices must be both provided or both omitted");
   bool has_extra = extra_k_cache.has_value();
   int64_t topk_extra = has_extra ? extra_indices.value().size(2) : 0;
