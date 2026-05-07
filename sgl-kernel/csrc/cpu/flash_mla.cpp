@@ -113,9 +113,12 @@ inline void dequantize_e4m3_tile_to_bf16(
   for (; i + 32 <= n; i += 32) {
     const __m256i fp8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
     const __m512bh bf16_ext = CVT_FP8_TO_BF16_EXT(fp8);
-    const __m512 f_lo = _mm512_mul_ps(CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_ext, 0)), vscale);
-    const __m512 f_hi = _mm512_mul_ps(CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_ext, 1)), vscale);
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)_mm512_cvtne2ps_pbh(f_hi, f_lo));
+    const __m512 f_lo =
+        _mm512_mul_ps(CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_ext, 0)), vscale);
+    const __m512 f_hi =
+        _mm512_mul_ps(CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_ext, 1)), vscale);
+    _mm512_storeu_si512(
+        reinterpret_cast<__m512i*>(dst + i), (__m512i)(_mm512_cvtne2ps_pbh(f_hi, f_lo)));
   }
   for (; i < n; ++i) {
     dst[i] = static_cast<at::BFloat16>(fp8_e4m3_to_float(src[i]) * scale);
