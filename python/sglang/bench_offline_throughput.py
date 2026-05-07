@@ -11,23 +11,27 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1
 """
 
 import argparse
+import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from sglang.bench_serving import (
+    DatasetRow,
     get_dataset,
     get_tokenizer,
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server import Engine, Runtime
+from sglang.lang.backend.runtime_endpoint import Runtime
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
 
 
@@ -39,20 +43,25 @@ class BenchArgs:
     dataset_path: str = ""
     num_prompts: int = 1000
     sharegpt_output_len: Optional[int] = None
+    sharegpt_context_len: Optional[int] = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
-    gen_num_groups: int = 64
-    gen_prompts_per_group: int = 16
-    gen_system_prompt_len: int = 2048
-    gen_question_len: int = 128
-    gen_output_len: int = 256
+    gsp_num_groups: int = 64
+    gsp_prompts_per_group: int = 16
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_output_len: int = 256
+    seed: int = 1
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
-    seed: int = 1
+    apply_chat_template: bool = False
+    profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
-    profile: bool = False
+    prompt_suffix: str = ""
+    return_logprob: bool = False
+    logprob_start_len: int = -1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -83,6 +92,12 @@ class BenchArgs:
             help="Output length for each request. Overrides the output length from the ShareGPT dataset.",
         )
         parser.add_argument(
+            "--sharegpt-context-len",
+            type=int,
+            default=BenchArgs.sharegpt_context_len,
+            help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
+        )
+        parser.add_argument(
             "--random-input-len",
             type=int,
             default=BenchArgs.random_input_len,
@@ -102,51 +117,62 @@ class BenchArgs:
             "used only for random dataset.",
         )
         parser.add_argument(
-            "--gen-num-groups",
+            "--gsp-num-groups",
             type=int,
-            default=BenchArgs.gen_num_groups,
+            default=BenchArgs.gsp_num_groups,
             help="Number of groups with shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-prompts-per-group",
+            "--gsp-prompts-per-group",
             type=int,
-            default=BenchArgs.gen_prompts_per_group,
+            default=BenchArgs.gsp_prompts_per_group,
             help="Number of prompts per group of shared prefix, used"
             "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-system-prompt-len",
+            "--gsp-system-prompt-len",
             type=int,
-            default=BenchArgs.gen_system_prompt_len,
+            default=BenchArgs.gsp_system_prompt_len,
             help="System prompt length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-question-len",
+            "--gsp-question-len",
             type=int,
-            default=BenchArgs.gen_question_len,
+            default=BenchArgs.gsp_question_len,
             help="Question length, used" "only for generate-shared-prefix",
         )
         parser.add_argument(
-            "--gen-output-len",
+            "--gsp-output-len",
             type=int,
-            default=BenchArgs.gen_output_len,
+            default=BenchArgs.gsp_output_len,
             help="Target length in tokens for outputs in generated-shared-prefix dataset",
         )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
-            type=bool,
-            default=BenchArgs.disable_ignore_eos,
+            action="store_true",
             help="Disable ignore EOS token",
         )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
             type=str,
+            default=BenchArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
         )
-        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--apply-chat-template",
+            action="store_true",
+            help="Apply chat template",
+        )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
         parser.add_argument(
             "--skip-warmup",
             action="store_true",
@@ -158,10 +184,21 @@ class BenchArgs:
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
         )
         parser.add_argument(
-            "--profile",
+            "--prompt-suffix",
+            type=str,
+            default="",
+            help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
+        )
+        parser.add_argument(
+            "--return-logprob",
             action="store_true",
-            help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            help="Enable returning log probabilities.",
+        )
+        parser.add_argument(
+            "--logprob-start-len",
+            type=int,
+            default=-1,
+            help="Start length for logprob. -1 means only return logprobs for output tokens (default). 0 means return logprobs for all tokens including input.",
         )
 
     @classmethod
@@ -173,16 +210,18 @@ class BenchArgs:
 def throughput_test_once(
     backend_name: str,
     backend,
-    reqs: List[Tuple[str, int, int]],
+    reqs: List[DatasetRow],
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
+    return_logprob: bool = False,
+    logprob_start_len: int = -1,
 ):
     measurement_results = {
         "backend": backend_name,
         "successful_requests": len(reqs),
         "total_latency": -1,
-        "total_input_tokens": sum(r[1] for r in reqs),
+        "total_input_tokens": sum(r.prompt_len for r in reqs),
         "total_output_tokens": -1,
         "request_throughput": -1,
         "input_throughput": -1,
@@ -190,11 +229,11 @@ def throughput_test_once(
         "total_throughput": -1,
     }
 
-    prompt = [r[0] for r in reqs]
+    prompt = [r.prompt for r in reqs]
     sampling_params = [
         {
             "temperature": 0,
-            "max_new_tokens": r[2],
+            "max_new_tokens": r.output_len,
             "ignore_eos": ignore_eos,
             **extra_request_body,
         }
@@ -202,18 +241,31 @@ def throughput_test_once(
     ]
 
     if profile:
+        assert (
+            "SGLANG_TORCH_PROFILER_DIR" in os.environ
+        ), "Please set SGLANG_TORCH_PROFILER_DIR."
+        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
     st = time.perf_counter()
-    gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    gen_out = backend.generate(
+        prompt=prompt,
+        sampling_params=sampling_params,
+        return_logprob=return_logprob,
+        logprob_start_len=logprob_start_len,
+    )
     latency = time.perf_counter() - st
 
     if profile:
+        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        known_files = set(os.listdir(dir))
         backend.stop_profile()
-        monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
+        monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
+
+    server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
     measurement_results["total_output_tokens"] = sum(
@@ -233,14 +285,18 @@ def throughput_test_once(
         + measurement_results["total_output_tokens"]
     ) / latency
 
+    if inspect.isawaitable(server_info):
+        server_info = asyncio.run(server_info)
+
+    measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
+        "last_gen_throughput"
+    ]
+
     return measurement_results
 
 
-def monitor_trace_file(directory, interval=1):
-
+def monitor_trace_file(known_files, directory, interval=1):
     print(f"Monitoring {directory} for new trace files...")
-
-    known_files = set(os.listdir(directory))
 
     while True:
         flag = False
@@ -287,7 +343,7 @@ def throughput_test(
     tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
-    # Set global environmnets
+    # Set global environments
     set_ulimit()
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
@@ -319,6 +375,8 @@ def throughput_test(
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=False,
+            return_logprob=bench_args.return_logprob,
+            logprob_start_len=bench_args.logprob_start_len,
         )
         time.sleep(0.5)
 
@@ -330,7 +388,10 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        return_logprob=bench_args.return_logprob,
+        logprob_start_len=bench_args.logprob_start_len,
     )
+    backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
@@ -345,6 +406,11 @@ def throughput_test(
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
     print(
         "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Last generation throughput (tok/s):", result["last_gen_throughput"]
+        )
     )
     print(
         "{:<40} {:<10.2f}".format(
@@ -376,6 +442,26 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    # handling ModelScope model downloads
+    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
+        if os.path.exists(args.model_path):
+            print(f"Using local model path: {args.model_path}")
+        else:
+            try:
+                from modelscope import snapshot_download
+
+                print(f"Using ModelScope to download model: {args.model_path}")
+
+                # download the model and replace args.model_path
+                args.model_path = snapshot_download(
+                    args.model_path,
+                )
+                print(f"Model downloaded to: {args.model_path}")
+            except Exception as e:
+                print(f"ModelScope download failed: {str(e)}")
+                raise e
+
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 

@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
+from sglang.utils import download_and_cache_file
 
 
 def load_questions(filename):
@@ -46,8 +47,14 @@ def answer_mt_bench(s, question_1, question_2):
 
 
 def main(args):
+    # Download question file if not exist
+    question_file = args.question_file
+    url = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
+    if not os.path.isfile(question_file):
+        question_file = download_and_cache_file(url)
+
     # Construct prompts
-    questions = load_questions(args.question_file)[: args.num_questions]
+    questions = load_questions(question_file)[: args.num_questions]
     arguments = [
         {"question_1": q["turns"][0], "question_2": q["turns"][1]} for q in questions
     ]
@@ -57,7 +64,7 @@ def main(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     rets = answer_mt_bench.run_batch(
         arguments,
         temperature=0,
@@ -66,7 +73,7 @@ def main(args):
         progress_bar=True,
     )
     answers = [[s["answer_1"], s["answer_2"]] for s in rets]
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     print(f"#questions: {len(questions)}, Latency: {latency:.2f}")
 

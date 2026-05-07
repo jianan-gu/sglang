@@ -18,8 +18,10 @@ REGEX_STR = r"\"[\w\d\s]*\""  # bugs with regex r"\".*\"" in interegular pkg
 class SglSamplingParams:
     max_new_tokens: int = 128
     min_new_tokens: int = 0
+    n: int = 1
     stop: Union[str, List[str]] = ()
     stop_token_ids: Optional[List[int]] = ()
+    stop_regex: Optional[Union[str, List[str]]] = ()
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1  # -1 means disable
@@ -41,8 +43,10 @@ class SglSamplingParams:
         return SglSamplingParams(
             self.max_new_tokens,
             self.min_new_tokens,
+            self.n,
             self.stop,
             self.stop_token_ids,
+            self.stop_regex,
             self.temperature,
             self.top_p,
             self.top_k,
@@ -63,6 +67,8 @@ class SglSamplingParams:
             warnings.warn("Regular expression is not supported in the OpenAI backend.")
         return {
             "max_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,
+            "n": self.n,
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -116,8 +122,10 @@ class SglSamplingParams:
         return {
             "max_new_tokens": self.max_new_tokens,
             "min_new_tokens": self.min_new_tokens,
+            "n": self.n,
             "stop": self.stop,
             "stop_token_ids": self.stop_token_ids,
+            "stop_regex": self.stop_regex,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
@@ -153,8 +161,10 @@ class SglFunction:
         self,
         *args,
         max_new_tokens: int = 128,
+        n: int = 1,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -178,11 +188,15 @@ class SglFunction:
             stop = []
         if stop_token_ids is None:
             stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
+            n=n,
             stop=stop,
             stop_token_ids=stop_token_ids,
+            stop_regex=stop_regex,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -211,8 +225,10 @@ class SglFunction:
         batch_kwargs,
         *,
         max_new_tokens: int = 128,
+        n: int = 1,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -227,6 +243,7 @@ class SglFunction:
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
+        generator_style: bool = False,
     ):
         from sglang.lang.interpreter import run_program_batch
 
@@ -234,6 +251,8 @@ class SglFunction:
             stop = []
         if stop_token_ids is None:
             stop_token_ids = []
+        if stop_regex is None:
+            stop_regex = []
 
         assert isinstance(batch_kwargs, (list, tuple))
         if len(batch_kwargs) == 0:
@@ -255,8 +274,10 @@ class SglFunction:
 
         default_sampling_para = SglSamplingParams(
             max_new_tokens=max_new_tokens,
+            n=n,
             stop=stop,
             stop_token_ids=stop_token_ids,
+            stop_regex=stop_regex,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -277,6 +298,7 @@ class SglFunction:
             default_sampling_para,
             num_threads,
             progress_bar,
+            generator_style=generator_style,
         )
 
     def trace(self, *, backend=None, **kwargs):
@@ -290,11 +312,6 @@ class SglFunction:
 
         backend = backend or global_config.default_backend
         return cache_program(self, backend)
-
-    def compile(self, *, backend=None):
-        from sglang.lang.compiler import compile_func
-
-        return compile_func(self, backend)
 
     def __call__(self, *args, **kwargs):
         from sglang.lang.tracer import TracingScope
@@ -437,8 +454,10 @@ class SglGen(SglExpr):
         name: Optional[str] = None,
         max_new_tokens: Optional[int] = None,
         min_new_tokens: Optional[int] = None,
+        n: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
+        stop_regex: Optional[Union[str, List[str]]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -454,13 +473,15 @@ class SglGen(SglExpr):
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
     ):
-        """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+        """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
         super().__init__()
         self.name = name
         self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
+            n=n,
             stop=stop,
+            stop_regex=stop_regex,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
             top_p=top_p,
@@ -593,3 +614,30 @@ class SglCommitLazy(SglExpr):
 
     def __repr__(self):
         return "CommitLazy()"
+
+
+class SglSeparateReasoning(SglExpr):
+    def __init__(self, model_type: str, expr: SglExpr):
+        super().__init__()
+        self.model_type = model_type
+
+        self.expr = expr
+        self.name = None
+        self._process_expr(expr)
+
+    def process_name_for_reasoning(self, name):
+        if not name:
+            raise ValueError("name must be provided")
+        return f"{name}_reasoning_content"
+
+    def _process_expr(self, expr):
+        if isinstance(expr, SglGen):
+            self.name = self.process_name_for_reasoning(expr.name)
+        elif isinstance(expr, SglSelect):
+            self.name = self.process_name_for_reasoning(expr.name)
+        elif isinstance(expr, SglExprList):
+            for x in expr.expr_list:
+                self._process_expr(x)
+
+    def __repr__(self):
+        return f"SeparateReasoning(model_type={self.model_type}, name={self.name})"

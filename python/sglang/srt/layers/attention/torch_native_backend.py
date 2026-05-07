@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
-from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -22,43 +23,6 @@ class TorchNativeAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         pass
-
-    def init_cuda_graph_state(self, max_bs: int):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor] = None,
-    ):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor] = None,
-    ):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
 
     def _run_sdpa_forward_extend(
         self,
@@ -129,6 +93,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                # scaled_dot_product_attention() expects query, key, and value to have the same dtype
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
             per_req_out_redudant = (
                 scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
@@ -198,6 +167,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                # scaled_dot_product_attention() expects query, key, and value to have the same dtype
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
             per_req_out = (
                 scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
@@ -229,15 +203,22 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
+
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
 
         self._run_sdpa_forward_extend(
             q_,
@@ -251,7 +232,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
-            causal=not layer.is_cross_attention,
+            causal=causal,
         )
         return o
 
@@ -273,10 +254,13 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
+
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -297,3 +281,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
 
         return o
+
+    def support_triton(self):
+        return False

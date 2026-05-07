@@ -2,86 +2,112 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+import logging
+from typing import TYPE_CHECKING, Any, Optional
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+import torch
+
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 
-class ChunkCacheEntry:
-    def __init__(self, rid, value):
-        self.rid = rid
-        self.value = value
+logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
-    def __init__(
-        self, req_to_token_pool: ReqToTokenPool, token_to_kv_pool: BaseTokenToKVPool
-    ):
-        self.disable = True
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
+    def __init__(self, params: CacheInitParams):
+        self.req_to_token_pool = params.req_to_token_pool
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.page_size = params.page_size
+        if self.token_to_kv_pool_allocator:
+            self.device = self.token_to_kv_pool_allocator.device
+        else:
+            self.device = torch.device("cpu")
 
-        self.reset()
+        self.protected_size_ = 0
+
+    def is_chunk_cache(self) -> bool:
+        return True
+
+    # NOTE (csy): this is to determine if a cache has prefix matching feature.
+    # Chunk cache always return True to indicate no prefix matching.
+    # TODO (csy): Using a prefix cache trait to replace this
+    @property
+    def disable(self):
+        return True
 
     def reset(self):
-        self.entries = {}
-
-    def match_prefix(self, rid: int, key: List[int]) -> Tuple[List[int], int]:
-        if rid not in self.entries:
-            return [], None
-
-        entry = self.entries[rid]
-        max_prefix_len = len(key)
-        return entry.value[:max_prefix_len], entry
-
-    def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
-        if token_ids is None:
-            token_id_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        else:
-            token_id_len = len(token_ids)
-
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :token_id_len
-        ]
-        self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool.free(kv_indices)
-
-        if req.rid in self.entries:
-            del self.entries[req.rid]
-
-    def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
-        if token_ids is None:
-            token_id_len = len(req.fill_ids)
-        else:
-            token_id_len = len(token_ids)
-
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :token_id_len
-        ]
-
-        if req.rid not in self.entries:
-            self.entries[req.rid] = ChunkCacheEntry(req.rid, kv_indices)
-
-        entry = self.entries[req.rid]
-        entry.value = kv_indices
-        req.prefix_indices = kv_indices
-        req.last_node = entry
-
-    def insert(self):
-        raise NotImplementedError()
-
-    def evict(self, num_tokens: int, evict_callback: Callable):
         pass
 
-    def inc_lock_ref(self, node):
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        return MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+        )
+
+    def insert(self, params: InsertParams) -> InsertResult:
+        # ChunkCache does not support prefix caching, so insert is a no-op
+        return InsertResult(prefix_len=0)
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        kv_committed_len = req.pop_committed_kv_cache()
+        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.token_to_kv_pool_allocator.free(kv_indices)
+
+    def cache_unfinished_req(self, req: Req, chunked=False):
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(req.fill_ids)
+        ]
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()
+
+    def inc_lock_ref(self, node: Any):
         return 0
 
-    def dec_lock_ref(self, node):
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
         return 0
 
-    def evictable_size(self):
+    def protected_size(self):
+        # NOTE: no protected size in chunk cache. Chunk cache's eviction is the same with request's lifecycle.
         return 0
+
+    def pretty_print(self):
+        return ""
+
+
+class SWAChunkCache(ChunkCache):
+    """ChunkCache with support for sliding window attention."""
+
+    def __init__(self, params: CacheInitParams):
+        super().__init__(params)
+
+        self.sliding_window_size = params.sliding_window_size
+        self.chunked_prefill_size = params.chunked_prefill_size
+
+    def supports_swa(self) -> bool:
+        assert (
+            self.sliding_window_size is not None
+        ), "sliding_window_size must be set for SWAChunkCache"
+        return True
+
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()

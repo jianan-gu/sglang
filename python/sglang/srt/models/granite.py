@@ -22,9 +22,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import GraniteConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -36,12 +35,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -62,14 +63,14 @@ class GraniteMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -133,14 +134,14 @@ class GraniteAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -157,6 +158,8 @@ class GraniteAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -205,14 +208,14 @@ class GraniteDecoderLayer(nn.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = GraniteMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -252,6 +255,7 @@ class GraniteModel(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -263,7 +267,10 @@ class GraniteModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 GraniteDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -300,17 +307,23 @@ class GraniteForCausalLM(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GraniteModel(config, quant_config=quant_config)
+        self.model = GraniteModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         # If tie_word_embeddings == True, then input and output embeddings are
         # the same tensor. Enforce during object creation so that weights will
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         if self.config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)
@@ -349,31 +362,6 @@ class GraniteForCausalLM(nn.Module):
             return logits_processor_output
         else:
             return self.pooler(hidden_states, forward_batch)
-
-    def get_hidden_dim(self, module_name):
-        # return input_dim, output_dim
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size // (
-                self.config.num_attention_heads // self.config.num_key_value_heads
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
-
-    def get_module_name(self, name):
-        params_mapping = {
-            "q_proj": "qkv_proj",
-            "k_proj": "qkv_proj",
-            "v_proj": "qkv_proj",
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-        }
-        return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:

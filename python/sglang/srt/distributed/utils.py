@@ -1,4 +1,5 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/utils.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/utils.py
+
 # Copyright 2023 The vLLM team.
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
@@ -64,7 +65,7 @@ def get_pp_indices(
 ) -> Tuple[int, int]:
     """Try to evenly distribute layers across partitions.
     If the number of layers is not divisible by the number of partitions,
-    the last partition will have the remaining layers.
+    the last N partitions will have one extra layer, where N = remainder.
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
@@ -82,12 +83,18 @@ def get_pp_indices(
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
     else:
-        layers_per_partition = num_hidden_layers // pp_size
-        start_layer = pp_rank * layers_per_partition
-        end_layer = start_layer + layers_per_partition
-
-        if pp_rank == pp_size - 1:
-            end_layer = num_hidden_layers
+        base_layers = num_hidden_layers // pp_size
+        remainder = num_hidden_layers % pp_size
+        # Distribute the extra layers to the last 'remainder' partitions
+        if pp_rank >= pp_size - remainder:
+            partitions_without_extra_layer = pp_size - remainder
+            # This partition gets one extra layer
+            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
+            end_layer = start_layer + (base_layers + 1)
+        else:
+            # This partition gets only base layers
+            start_layer = pp_rank * base_layers
+            end_layer = start_layer + base_layers
 
     return (start_layer, end_layer)
 
@@ -126,14 +133,14 @@ class StatelessProcessGroup:
         key = f"send_to/{dst}/{self.send_dst_counter[dst]}"
         self.store.set(key, pickle.dumps(obj))
         self.send_dst_counter[dst] += 1
-        self.entries.append((key, time.time()))
+        self.entries.append((key, time.perf_counter()))
 
     def expire_data(self):
         """Expire data that is older than `data_expiration_seconds` seconds."""
         while self.entries:
             # check the oldest entry
             key, timestamp = self.entries[0]
-            if time.time() - timestamp > self.data_expiration_seconds:
+            if time.perf_counter() - timestamp > self.data_expiration_seconds:
                 self.store.delete_key(key)
                 self.entries.popleft()
             else:
@@ -157,7 +164,7 @@ class StatelessProcessGroup:
             key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
-            self.entries.append((key, time.time()))
+            self.entries.append((key, time.perf_counter()))
             return obj
         else:
             key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"

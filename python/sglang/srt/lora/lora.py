@@ -18,386 +18,204 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
+import logging
+from typing import Dict, List
 
-import json
-import os
-import re
-from typing import Any, Dict, List, Optional, Tuple
-
-import safetensors.torch
 import torch
 from torch import nn
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
+from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
-
-class BaseLayerWithLoRA(nn.Module):
-    def __init__(self, base_layer, segment_gemm, lora_rank, scaling):
-        super().__init__()
-        self.base_layer = base_layer
-        self.segment_gemm = segment_gemm
-        self.lora_rank = lora_rank
-        self.scaling = scaling
-        self.set_lora = False
-
-    def forward(self, x: torch.Tensor):
-        return self.base_layer.forward(x)
-
-    def set_lora_info(self, *args):
-        pass
-
-
-class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self, base_layer: VocabParallelEmbedding, segment_gemm, lora_rank, scaling
-    ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling)
-        self.weight = base_layer.weight
-
-
-class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self, base_layer: ColumnParallelLinear, segment_gemm, lora_rank, scaling
-    ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling)
-
-    def apply_lora(self, output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        # TODO
-        return output
-
-    def forward(self, input_: torch.Tensor):
-        # duplicate the logic in ColumnParallelLinear
-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
-
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_)
-
-        if self.base_layer.gather_output:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
-        return output, output_bias
-
-
-class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self, base_layer: MergedColumnParallelLinear, segment_gemm, lora_rank, scaling
-    ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling)
-
-    def set_lora_info(self, A_buffer, B_buffer, bs, seg_indptr, weight_indices):
-        self.set_lora = True
-        self.A_buffer = A_buffer
-        self.B_buffer = B_buffer
-        self.bs = bs
-        self.seg_indptr = seg_indptr
-        self.weight_indices = weight_indices
-
-    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.segment_gemm.run(
-            x=x,
-            weights=self.A_buffer,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        # FIXME
-        lora_output = torch.empty_like(base_output)
-        output_dim = lora_output.shape[-1] // 2
-        for i in range(2):
-            left = output_dim * i
-            right = left + output_dim
-            lora_output[:, left:right] = self.segment_gemm.run(
-                x=lora_a_output[
-                    :, self.lora_rank * i : self.lora_rank * (i + 1)
-                ].contiguous(),
-                weights=self.B_buffer[:, left:right, :].contiguous(),
-                batch_size=self.bs,
-                weight_column_major=True,
-                seg_indptr=self.seg_indptr,
-                weight_indices=self.weight_indices,
-            )
-        return base_output + lora_output * self.scaling
-
-
-class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self, base_layer: QKVParallelLinear, segment_gemm, lora_rank, scaling
-    ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling)
-
-    def set_lora_info(
-        self, A_buffer_qkv, B_buffer_q, B_buffer_kv, bs, seg_indptr, weight_indices
-    ):
-        self.set_lora = True
-        self.A_buffer_qkv = A_buffer_qkv
-        self.B_buffer_q = B_buffer_q
-        self.B_buffer_kv = B_buffer_kv
-        self.bs = bs
-        self.seg_indptr = seg_indptr
-        self.weight_indices = weight_indices
-
-    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.segment_gemm.run(
-            x=x,
-            weights=self.A_buffer_qkv,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        # FIXME parallelize qkv
-        lora_output = torch.empty_like(base_output)
-        # q
-        output_dim_q = self.B_buffer_q.shape[-2]
-        lora_output[:, :output_dim_q] = self.segment_gemm.run(
-            x=lora_a_output[:, : self.lora_rank].contiguous(),
-            weights=self.B_buffer_q,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        # kv
-        output_dim_kv = self.B_buffer_kv.shape[-2] // 2
-        for i in range(2):
-            left = output_dim_kv * i
-            right = left + output_dim_kv
-            lora_output[:, output_dim_q + left : output_dim_q + right] = (
-                self.segment_gemm.run(
-                    x=lora_a_output[
-                        :, self.lora_rank * (i + 1) : self.lora_rank * (i + 2)
-                    ].contiguous(),
-                    weights=self.B_buffer_kv[:, left:right, :].contiguous(),
-                    batch_size=self.bs,
-                    weight_column_major=True,
-                    seg_indptr=self.seg_indptr,
-                    weight_indices=self.weight_indices,
-                )
-            )
-        return base_output + lora_output * self.scaling
-
-
-class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self, base_layer: RowParallelLinear, segment_gemm, lora_rank, scaling
-    ) -> None:
-        super().__init__(base_layer, segment_gemm, lora_rank, scaling)
-
-    def set_lora_info(self, A_buffer, B_buffer, bs, seg_indptr, weight_indices):
-        self.set_lora = True
-        self.A_buffer = A_buffer
-        self.B_buffer = B_buffer
-        self.bs = bs
-        self.seg_indptr = seg_indptr
-        self.weight_indices = weight_indices
-
-    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_output = self.segment_gemm.run(
-            x=x,
-            weights=self.A_buffer,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        lora_output = self.segment_gemm.run(
-            x=lora_output,
-            weights=self.B_buffer,
-            batch_size=self.bs,
-            weight_column_major=True,
-            seg_indptr=self.seg_indptr,
-            weight_indices=self.weight_indices,
-        )
-        return base_output + lora_output * self.scaling
-
-    def forward(self, input_):
-        # duplicate the logic in RowParallelLinear
-        if self.base_layer.input_is_parallel:
-            input_parallel = input_
-        else:
-            tp_rank = get_tensor_model_parallel_rank()
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.base_layer.tp_size
-            )
-            input_parallel = splitted_input[tp_rank].contiguous()
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
-        )
-
-        if self.set_lora:
-            output_parallel = self.apply_lora(output_parallel, input_parallel)
-
-        if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output_ = output_parallel
-
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return output, output_bias
-
-
-def get_lora_layer(
-    layer: nn.Module, segment_gemm, lora_rank, scaling
-) -> BaseLayerWithLoRA:
-    supported_layer_types = {
-        # the order matters
-        VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
-        QKVParallelLinear: QKVParallelLinearWithLoRA,
-        MergedColumnParallelLinear: MergedColumnParallelLinearWithLoRA,
-        ColumnParallelLinear: ColumnParallelLinearWithLoRA,
-        RowParallelLinear: RowParallelLinearWithLoRA,
-    }
-    for src_layer_type, lora_layer_type in supported_layer_types.items():
-        if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(layer, segment_gemm, lora_rank, scaling)
-            return ret
-    raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
-
-
-def get_mapped_params(module_names):
-    ret = set()
-    for module_name in module_names:
-        ret.add(params_mapping(module_name))
-    return list(ret)
+logger = logging.getLogger(__name__)
 
 
 class LoRALayer(nn.Module):
-    def __init__(self, config, base_hf_config):
+    def __init__(self, config: LoRAConfig, base_hf_config: AutoConfig):
         super().__init__()
-        self.config = config
-        self.base_hf_config = base_hf_config
-        self.weights = {}
-        self.weight_gpu = {}
+        self.config: LoRAConfig = config
+        self.base_hf_config: AutoConfig = base_hf_config
 
-    def load_to_gpu(self):
-        for name, weight in self.weights.items():
-            self.weight_gpu[name] = weight.to(torch.float16).to("cuda")
-
-    def offload_from_gpu(self):
-        for name, weight in self.weights.items():
-            self.weight_gpu[name] = None
+        # lora weights in cpu. The weights are loaded from checkpoint.
+        self.weights: Dict[str, torch.Tensor] = {}
 
 
 class LoRAAdapter(nn.Module):
-    def __init__(self, uid, config, base_hf_config, load_config):
-        super().__init__()
-        self.uid = uid
-        self.config = config
-        assert self.config.hf_config["peft_type"].lower() == "lora"
-        self.base_hf_config = base_hf_config
-        self.load_config = load_config
-        self.scaling = self.config.lora_alpha / self.config.r
 
-        self.layers = nn.ModuleList(
+    def __init__(
+        self,
+        uid: str,
+        config: LoRAConfig,
+        base_hf_config: AutoConfig,
+        load_config: LoadConfig,
+        lora_backend: BaseLoRABackend,
+    ):
+        super().__init__()
+        self.uid: str = uid
+        self.config: LoRAConfig = config
+        assert self.config.hf_config["peft_type"].lower() == "lora"
+        self.base_hf_config: AutoConfig = base_hf_config
+        self.load_config: LoadConfig = load_config
+        self.lora_backend: BaseLoRABackend = lora_backend
+        self.scaling: float = self.config.lora_alpha / self.config.r
+
+        self.layers: List[LoRALayer] = nn.ModuleList(
             [
                 LoRALayer(config, base_hf_config)
-                for i in range(base_hf_config.num_hidden_layers)
+                for _ in range(base_hf_config.num_hidden_layers)
             ]
         )
 
-        self.weights = {}
-        self.weights_gpu = {}
+        self.embedding_layers: Dict[str, torch.Tensor] = {}
+        self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
-    def get_stacked_multiply(self, module_name):
-        stacked_rank = {
-            "qkv_proj": 3,
-            "kv_proj": 2,
-            "gate_up_proj": 2,
-        }
-        return stacked_rank[module_name] if module_name in stacked_rank else 1
-
-    def load_to_gpu(self):
-        for name, weight in self.weights.items():
-            self.weights_gpu[name] = weight.to(torch.float16).to("cuda")
-        for layer in self.layers:
-            layer.load_to_gpu()
-
-    def offload_from_gpu(self):
-        for name, weight in self.weights.items():
-            self.weights_gpu[name] = None
-        for layer in self.layers:
-            layer.offload_from_gpu()
-
-    # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
+
+        # Get normalized target modules for filtering
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            match = re.search(r"layers\.(\d+)\.", name)
-            if match is not None:
-                layer_id = int(match.group(1))
-                self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            else:
-                self.weights[name] = loaded_weight.cpu()
+            self._process_weight(name, loaded_weight)
 
-        # stack kv_proj and gate_up_proj
-        for i in range(self.base_hf_config.num_hidden_layers):
-            layer = self.layers[i]
-            weight_names = [name for name, _ in layer.weights.items()]
-            for weight_name in weight_names:
-                if "k_proj" in weight_name:
-                    q_name = weight_name.replace("k_proj", "q_proj")
-                    v_name = weight_name.replace("k_proj", "v_proj")
-                    kv_name = weight_name.replace("k_proj", "kv_proj")
-                    qkv_name = weight_name.replace("k_proj", "qkv_proj")
-                    if "lora_A" in weight_name:
-                        layer.weights[qkv_name] = torch.cat(
-                            (
-                                layer.weights[q_name],
-                                layer.weights[weight_name],
-                                layer.weights[v_name],
-                            ),
-                            0,
-                        )
-                        layer.weights.pop(q_name)
-                        layer.weights.pop(weight_name)
-                        layer.weights.pop(v_name)
-                    else:
-                        layer.weights[kv_name] = torch.cat(
-                            (
-                                layer.weights[weight_name],
-                                layer.weights[v_name],
-                            ),
-                            0,
-                        )
-                        layer.weights.pop(weight_name)
-                        layer.weights.pop(v_name)
-                elif "gate_proj" in weight_name:
-                    up_name = weight_name.replace("gate_proj", "up_proj")
-                    gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
-                    layer.weights[gate_up_name] = torch.cat(
-                        (layer.weights[weight_name], layer.weights[up_name]), 0
+        self._normalize_weights()
+
+    def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        for name, tensor in tensors.items():
+            self._process_weight(name, tensor)
+
+        self._normalize_weights()
+
+    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
+        normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
+
+        layer_id = get_layer_id(name)
+        if layer_id is not None:
+            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+        elif "embed_tokens" in name or "lm_head" in name:
+            # Check if this module is declared in target_modules before loading
+            module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
+            if module_name in normalized_target_modules:
+                self.embedding_layers[name] = loaded_weight.cpu()
+            else:
+                logger.debug(
+                    f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
+                )
+        elif "input_embeddings" in name or "output_embeddings" in name:
+            # added/extra token emb
+            self.added_tokens_embeddings[name] = loaded_weight.cpu()
+            assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
+                f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
+                f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+            )
+
+    def _normalize_weights(self):
+        # normalize kv_proj and gate_up_proj
+        for layer in self.layers:
+            weight_names = list(layer.weights.keys())
+            self.normalize_qkv_proj(weight_names, layer.weights)
+            self.normalize_gate_up_proj(weight_names, layer.weights)
+
+    def normalize_qkv_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
+        target_module = set()
+        for weight_name in weight_names:
+            if "k_proj" in weight_name:
+                target_module.add("k_proj")
+            if "q_proj" in weight_name:
+                target_module.add("q_proj")
+            if "v_proj" in weight_name:
+                target_module.add("v_proj")
+            if "qkv_proj" in weight_name:
+                target_module.add("qkv_proj")
+        if len(target_module) == 0:
+            return
+
+        for weight_name in weight_names:
+            # We assume every lora adaptor should contain lora modules for q_proj
+            if "q_proj" in weight_name:
+                q_name = weight_name
+                k_name = weight_name.replace("q_proj", "k_proj")
+                v_name = weight_name.replace("q_proj", "v_proj")
+                qkv_name = weight_name.replace("q_proj", "qkv_proj")
+
+                # If k_proj doesn't have lora, initialize it to zero
+                k_proj_weight = (
+                    weights[k_name]
+                    if "k_proj" in target_module
+                    else torch.zeros_like(weights[v_name])
+                )
+                weights[qkv_name] = torch.cat(
+                    (
+                        weights[q_name],
+                        k_proj_weight,
+                        weights[v_name],
+                    ),
+                    0,
+                )
+                weights.pop(q_name)
+                if "k_proj" in target_module:
+                    weights.pop(k_name)
+                weights.pop(v_name)
+            elif "qkv_proj" in weight_name:
+                # If qkv_proj is already stacked, we normalize it following the SGL convention.
+                qkv_name = weight_name
+                q_name = weight_name.replace("qkv_proj", "q_proj")
+                k_name = weight_name.replace("qkv_proj", "k_proj")
+                v_name = weight_name.replace("qkv_proj", "v_proj")
+                if "lora_A" in weight_name:
+                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
+                # else: no-op as LoRA B weight is already stacked.
+
+    def normalize_gate_up_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        for weight_name in weight_names:
+            if "gate_proj" in weight_name:
+                up_name = weight_name.replace("gate_proj", "up_proj")
+                gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
+                if up_name not in weights:
+                    weights[up_name] = torch.zeros_like(weights[weight_name])
+                    assert self.lora_backend.name in LORA_SUPPORTED_BACKENDS, (
+                        f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b for b in LORA_SUPPORTED_BACKENDS)}"
+                        f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
+                        f"or consider implementing custom initialization logic for other backends."
                     )
-                    layer.weights.pop(weight_name)
-                    layer.weights.pop(up_name)
+                weights[gate_up_name] = torch.cat(
+                    (weights[weight_name], weights[up_name]), 0
+                )
+                weights.pop(weight_name)
+                if up_name in weights:
+                    weights.pop(up_name)
+            elif "gate_up_proj" in weight_name:
+                # If gate_up_proj is already stacked, we normalize it following the SGL convention
+                gate_up_name = weight_name
+                if "lora_A" in weight_name:
+                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                # else: no-op as LoRA B weight is already stacked.
+
+    def pin_weights_in_cpu(self):
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                layer.weights[name] = weight.pin_memory()
+
+        for name, weight in self.embedding_layers.items():
+            self.embedding_layers[name] = weight.pin_memory()
+
+        for name, weight in self.added_tokens_embeddings.items():
+            self.added_tokens_embeddings[name] = weight.pin_memory()
