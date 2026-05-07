@@ -26,6 +26,7 @@ from sglang.lang.ir import (
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
+    SglSeparateReasoning,
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
@@ -96,6 +97,7 @@ def run_program_batch(
     default_sampling_para,
     num_threads,
     progress_bar,
+    generator_style=False,
 ):
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
@@ -109,6 +111,17 @@ def run_program_batch(
         num_threads = max(96, multiprocessing.cpu_count() * 16)
     num_threads = min(num_threads, len(batch_arguments))
 
+    if generator_style:
+        return _run_program_batch_generator(
+            program,
+            backend,
+            batch_arguments,
+            default_sampling_para,
+            num_threads,
+            progress_bar,
+        )
+
+    # Original code path when generator_style=False
     if num_threads == 1:
         rets = []
         if progress_bar:
@@ -166,6 +179,64 @@ def run_program_batch(
             pbar.close()
 
     return rets
+
+
+def _run_program_batch_generator(
+    program,
+    backend,
+    batch_arguments,
+    default_sampling_para,
+    num_threads,
+    progress_bar,
+):
+    """Helper function that yields results one by one using chunking to avoid overwhelming ThreadPoolExecutor."""
+    if num_threads == 1:
+        iterator = tqdm.tqdm(batch_arguments) if progress_bar else batch_arguments
+        for arguments in iterator:
+            yield run_program(
+                program,
+                backend,
+                (),
+                arguments,
+                default_sampling_para,
+                False,
+                True,
+            )
+    else:
+        pbar = tqdm.tqdm(total=len(batch_arguments)) if progress_bar else None
+
+        # Process in chunks to avoid overwhelming ThreadPoolExecutor
+        # Otherwise, ThreadPoolExecutor.submit will block after adding certain number of tasks
+        # so we will never reach "yield" until all tasks are done
+        chunk_size = 200
+
+        with ThreadPoolExecutor(num_threads) as executor:
+            for chunk_start in range(0, len(batch_arguments), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(batch_arguments))
+                chunk_futures = []
+
+                # Submit chunk of tasks
+                for i in range(chunk_start, chunk_end):
+                    future = executor.submit(
+                        run_program,
+                        program,
+                        backend,
+                        (),
+                        batch_arguments[i],
+                        default_sampling_para,
+                        False,
+                        True,
+                    )
+                    if pbar:
+                        future.add_done_callback(lambda _: pbar.update())
+                    chunk_futures.append(future)
+
+                # Yield results from this chunk as they complete
+                for future in chunk_futures:
+                    yield future.result()
+
+        if pbar:
+            pbar.close()
 
 
 def cache_program(program, backend):
@@ -277,7 +348,7 @@ class StreamExecutor:
         size: int = 1,
         position_ids_offset: Optional[List[int]] = None,
     ):
-        if size > 1:
+        if size > 1 and str(self.text_):
             self.submit(SglCommitLazy())
 
         self.sync()
@@ -402,6 +473,8 @@ class StreamExecutor:
                 self._execute_concatenate_and_append_kv_cache(other)
             else:
                 self._execute_concatenate_and_append_text(other)
+        elif isinstance(other, SglSeparateReasoning):
+            self._execute_separate_reasoning(other)
         else:
             raise ValueError(f"Unknown type: {type(other)}")
 
@@ -496,13 +569,13 @@ class StreamExecutor:
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
-
         if not self.stream:
             if self.num_api_spec_tokens is None:
                 comp, meta_info = self.backend.generate(
                     self,
                     sampling_params=sampling_params,
                 )
+
             else:
                 if self.backend.is_chat_model:
                     # Speculative execution on models with only chat interface.
@@ -517,8 +590,11 @@ class StreamExecutor:
 
                 else:  # Speculative execution on models with completion interface
                     comp, meta_info = self._spec_gen(sampling_params)
-
-            self.text_ += comp
+            if isinstance(comp, list):
+                self.text_ += comp[0]
+            else:
+                assert isinstance(comp, str)
+                self.text_ += comp
 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
@@ -651,8 +727,44 @@ class StreamExecutor:
         src_rids = [state.stream_executor.sid for state in expr.states]
         self.backend.concatenate_and_append(src_rids, self.sid)
 
+    def _execute_separate_reasoning(self, expr: SglSeparateReasoning):
+        if self.stream:
+            # separate reasoning for stream is not supported
+            return
+
+        if (
+            self.cur_role == "assistant"
+            and self.num_api_spec_tokens is not None
+            and self.backend.is_chat_model
+        ):
+            # Execute the stored lazy generation calls
+            self.backend.role_end_generate(self)
+
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        reasoning_parser = ReasoningParser(expr.model_type)
+        other = expr.expr
+        if not other:
+            return
+        elif isinstance(other, SglGen) or isinstance(other, SglSelect):
+            cur_text = self.get_var(other.name)
+            reasoning, normal_text = reasoning_parser.parse_non_stream(cur_text)
+            reasoning_name = expr.process_name_for_reasoning(other.name)
+            self.set_var(other.name, normal_text)
+            self.set_var(reasoning_name, reasoning)
+            # the variable is ready to be used
+            self.variable_event[reasoning_name].set()
+            self.text_ = self.text_[: self.cur_role_begin_pos] + normal_text
+        elif isinstance(other, SglExprList):
+            for x in other.expr_list:
+                self._execute_separate_reasoning(
+                    SglSeparateReasoning(expr.model_type, x)
+                )
+
     def _init_var_event(self, expr):
-        if isinstance(expr, (SglGen, SglSelect, SglVarScopeBegin)):
+        if isinstance(
+            expr, (SglGen, SglSelect, SglVarScopeBegin, SglSeparateReasoning)
+        ):
             self.variable_event[expr.name] = threading.Event()
             if self.stream:
                 self.stream_var_event[expr.name] = threading.Event()
@@ -677,8 +789,10 @@ class StreamExecutor:
         for item in [
             "max_new_tokens",
             "min_new_tokens",
+            "n",
             "stop",
             "stop_token_ids",
+            "stop_regex",
             "temperature",
             "top_p",
             "top_k",

@@ -37,7 +37,7 @@ prompt_lib = [
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)
+    lines = list(read_jsonl(args.data_path))
 
     # Construct prompts
     # k = args.num_shot
@@ -90,7 +90,7 @@ def main(args):
     backend = select_sglang_backend(args)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = multi_chain_gsm8k.run_batch(
         arguments,
         temperature=0,
@@ -98,7 +98,7 @@ def main(args):
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     preds = []
     for i in range(len(states)):
