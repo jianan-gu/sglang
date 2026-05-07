@@ -101,6 +101,32 @@ inline float fp8_e8m0_to_float(uint8_t v) {
   return u.f;
 }
 
+inline void dequantize_e4m3_tile_to_bf16(
+    at::BFloat16* __restrict__ dst,
+    const uint8_t* __restrict__ src,
+    int64_t n,
+    float scale) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const __m512 vscale =
+      _mm512_mul_ps(_mm512_set1_ps(scale), _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS)));
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    const __m256i fp8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+    const __m512bh bf16_ext = CVT_FP8_TO_BF16_EXT(fp8);
+    const __m512 f_lo = _mm512_mul_ps(CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_ext, 0)), vscale);
+    const __m512 f_hi = _mm512_mul_ps(CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_ext, 1)), vscale);
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i), (__m512i)_mm512_cvtne2ps_pbh(f_hi, f_lo));
+  }
+  for (; i < n; ++i) {
+    dst[i] = static_cast<at::BFloat16>(fp8_e4m3_to_float(src[i]) * scale);
+  }
+#else
+  for (int64_t i = 0; i < n; ++i) {
+    dst[i] = static_cast<at::BFloat16>(fp8_e4m3_to_float(src[i]) * scale);
+  }
+#endif
+}
+
 // Dequantize the active FP8 KV-cache prefix into a contiguous BF16 tensor of
 // shape [active_total_tokens, d_qk].  This is parallel over tokens.
 //
@@ -135,11 +161,8 @@ void dequantize_fp8_kvcache_impl(
             reinterpret_cast<const at::BFloat16*>(src + meta.d_nope + meta.num_tiles * 4);
 
         for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
-          const float sc = scale_ptr[tile];
-          for (int64_t i = 0; i < meta.tile_size; ++i) {
-            const int64_t k = tile * meta.tile_size + i;
-            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(nope_ptr[k]) * sc);
-          }
+          const int64_t k = tile * meta.tile_size;
+          dequantize_e4m3_tile_to_bf16(dst + k, nope_ptr + k, meta.tile_size, scale_ptr[tile]);
         }
         // copy bf16 RoPE part as-is
         for (int64_t k = 0; k < meta.d_rope; ++k) {
@@ -169,11 +192,8 @@ void dequantize_fp8_kvcache_impl(
             reinterpret_cast<const at::BFloat16*>(nope_rope + meta.d_nope);
 
         for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
-          const float sc = fp8_e8m0_to_float(scale_base[tile]);
-          for (int64_t i = 0; i < meta.tile_size; ++i) {
-            const int64_t k = tile * meta.tile_size + i;
-            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(nope_ptr[k]) * sc);
-          }
+          const int64_t k = tile * meta.tile_size;
+          dequantize_e4m3_tile_to_bf16(dst + k, nope_ptr + k, meta.tile_size, fp8_e8m0_to_float(scale_base[tile]));
         }
         for (int64_t k = 0; k < meta.d_rope; ++k) {
           dst[meta.d_nope + k] = rope_ptr[k];
