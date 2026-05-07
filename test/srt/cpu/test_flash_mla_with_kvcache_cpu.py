@@ -395,8 +395,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
 
     def test_with_short_topk_length(self):
         # Covers the optimized path that stops processing once topk_length is
-        # reached instead of iterating over the full preallocated topk width;
-        # topk_length <= 32 also exercises the dynamic BLOCK_N dispatch.
+        # reached instead of iterating over the full preallocated topk width.
         for is_fp8_kvcache in (True, False):
             with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
                 self._run_one(
