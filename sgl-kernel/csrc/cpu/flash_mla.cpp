@@ -184,47 +184,60 @@ inline __attribute__((always_inline)) __m512i cvt_fp8_32_to_scaled_bf16(__m256i 
 }
 
 template <int64_t LAYOUT>
-inline __m512i load_fp8_kvcache_32(
+inline __attribute__((always_inline)) __m512i load_fp8_kvcache_32_from_row(
+    const uint8_t* __restrict__ row_base, const uint8_t* __restrict__ scale_base, int dim_offset) {
+  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
+  constexpr FP8LayoutMeta meta =
+      (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4} : FP8LayoutMeta{512, 448, 64, 64, 7};
+
+  if constexpr (LAYOUT == kV32FP8Sparse) {
+    if (dim_offset < meta.d_nope) {
+      const auto* scale_ptr = reinterpret_cast<const float*>(scale_base);
+      const float scale = scale_ptr[dim_offset / meta.tile_size];
+      return cvt_fp8_32_to_scaled_bf16(
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_base + dim_offset)), scale);
+    }
+    const auto* rope_ptr = reinterpret_cast<const at::BFloat16*>(row_base + meta.d_nope + meta.num_tiles * 4);
+    return _mm512_loadu_si512(rope_ptr + dim_offset - meta.d_nope);
+  } else {
+    if (dim_offset < meta.d_nope) {
+      const float scale = fp8_e8m0_to_float(scale_base[dim_offset / meta.tile_size]);
+      return cvt_fp8_32_to_scaled_bf16(
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_base + dim_offset)), scale);
+    }
+    const auto* rope_ptr = reinterpret_cast<const at::BFloat16*>(row_base + meta.d_nope);
+    return _mm512_loadu_si512(rope_ptr + dim_offset - meta.d_nope);
+  }
+}
+
+template <int64_t LAYOUT>
+inline __attribute__((always_inline)) void init_fp8_kvcache_tile_rows(
     const uint8_t* __restrict__ fp8_storage,
-    int64_t block_size,
-    int64_t storage_block_stride_bytes,
-    int64_t token_idx,
-    int dim_offset) {
+    const int64_t block_size,
+    const int64_t storage_block_stride_bytes,
+    const int64_t token_idx,
+    const uint8_t*& row_base,
+    const uint8_t*& scale_base) {
   static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
   constexpr FP8LayoutMeta meta =
       (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4} : FP8LayoutMeta{512, 448, 64, 64, 7};
   const int64_t block_idx = token_idx / block_size;
   const int64_t block_off = token_idx - block_idx * block_size;
   const uint8_t* block_base = fp8_storage + block_idx * storage_block_stride_bytes;
-
   if constexpr (LAYOUT == kV32FP8Sparse) {
     constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;
-    const uint8_t* token_base = block_base + block_off * bytes_per_token;
-    if (dim_offset < meta.d_nope) {
-      const auto* scale_ptr = reinterpret_cast<const float*>(token_base + meta.d_nope);
-      const float scale = scale_ptr[dim_offset / meta.tile_size];
-      return cvt_fp8_32_to_scaled_bf16(
-          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(token_base + dim_offset)), scale);
-    }
-    const auto* rope_ptr = reinterpret_cast<const at::BFloat16*>(token_base + meta.d_nope + meta.num_tiles * 4);
-    return _mm512_loadu_si512(rope_ptr + dim_offset - meta.d_nope);
+    row_base = block_base + block_off * bytes_per_token;
+    scale_base = row_base + meta.d_nope;
   } else {
     constexpr int64_t nope_rope_per_token = meta.d_nope + 2 * meta.d_rope;
     constexpr int64_t scale_stride = 8;
-    const uint8_t* nope_rope = block_base + block_off * nope_rope_per_token;
-    if (dim_offset < meta.d_nope) {
-      const uint8_t* scale_base = block_base + block_size * nope_rope_per_token + block_off * scale_stride;
-      const float scale = fp8_e8m0_to_float(scale_base[dim_offset / meta.tile_size]);
-      return cvt_fp8_32_to_scaled_bf16(
-          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(nope_rope + dim_offset)), scale);
-    }
-    const auto* rope_ptr = reinterpret_cast<const at::BFloat16*>(nope_rope + meta.d_nope);
-    return _mm512_loadu_si512(rope_ptr + dim_offset - meta.d_nope);
+    row_base = block_base + block_off * nope_rope_per_token;
+    scale_base = block_base + block_size * nope_rope_per_token + block_off * scale_stride;
   }
 }
 
-template <typename scalar_t, typename index_t, typename load_vec_t>
-inline void sparse_pack_vnni_Nx32(
+template <bool convert_v, typename scalar_t, typename index_t, typename load_vec_t>
+inline __attribute__((always_inline)) void sparse_pack_vnni_Nx32(
     scalar_t* __restrict__ dst0,
     scalar_t* __restrict__ dst1,
     const index_t* __restrict__ ind,
@@ -233,7 +246,6 @@ inline void sparse_pack_vnni_Nx32(
     int dim_offset,
     int ld_dst0,
     int ld_dst1,
-    bool convert_v,
     const load_vec_t& load_vec) {
   __m512i vinputs[16];
   int n = 0;
@@ -241,14 +253,14 @@ inline void sparse_pack_vnni_Nx32(
     if (!valid_mask[n]) {
       vinputs[n] = _mm512_set1_epi32(0);
     } else {
-      vinputs[n] = load_vec(static_cast<int64_t>(ind[n]), dim_offset);
+      vinputs[n] = load_vec(n, static_cast<int64_t>(ind[n]), dim_offset);
     }
   }
   for (; n < 16; ++n) {
     vinputs[n] = _mm512_set1_epi32(0);
   }
 
-  if (convert_v) {
+  if constexpr (convert_v) {
     for (int nn = 0; nn < 16; nn += 2) {
       __m512i d0, d1;
       std::tie(d0, d1) = transpose_2x32_16bit(vinputs[nn], vinputs[nn + 1]);
@@ -281,14 +293,15 @@ void sparse_pack_vnni(
 #if defined(CPU_CAPABILITY_AVX512)
   const int NB = div_up(N, 16);
   const int KB = K / 32;
-  const int KBv = Kv / 32;
-  auto load_vec = [src, ld_src](int64_t idx, int dim_offset) {
+  const int KBv = std::min(Kv / 32, KB);
+  auto load_vec = [src, ld_src](int n, int64_t idx, int dim_offset) {
+    UNUSED(n);
     return _mm512_loadu_si512(src + idx * ld_src + dim_offset);
   };
   for (int nb = 0; nb < NB; ++nb) {
-    for (int kb = 0; kb < KB; ++kb) {
+    for (int kb = 0; kb < KBv; ++kb) {
       int nb_size = std::min(N - nb * 16, 16);
-      sparse_pack_vnni_Nx32<scalar_t, index_t>(
+      sparse_pack_vnni_Nx32<true, scalar_t, index_t>(
           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
           /*     ind */ ind + nb * 16,
@@ -297,7 +310,19 @@ void sparse_pack_vnni(
           /* dim_off */ kb * 32,
           /* ld_dst0 */ ld_dst0,
           /* ld_dst1 */ ld_dst1,
-          /*   cvt_v */ kb < KBv,
+          /* load_vec */ load_vec);
+    }
+    for (int kb = KBv; kb < KB; ++kb) {
+      int nb_size = std::min(N - nb * 16, 16);
+      sparse_pack_vnni_Nx32<false, scalar_t, index_t>(
+          /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
+          /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
+          /*     ind */ ind + nb * 16,
+          /*   valid */ valid_mask + nb * 16,
+          /*       N */ nb_size,
+          /* dim_off */ kb * 32,
+          /* ld_dst0 */ ld_dst0,
+          /* ld_dst1 */ ld_dst1,
           /* load_vec */ load_vec);
     }
   }
@@ -351,14 +376,31 @@ void sparse_pack_vnni_fp8(
 #if defined(CPU_CAPABILITY_AVX512)
   const int NB = div_up(N, 16);
   const int KB = K / 32;
-  const int KBv = Kv / 32;
-  auto load_vec = [fp8_storage, block_size, storage_block_stride_bytes](int64_t idx, int dim_offset) {
-    return load_fp8_kvcache_32<LAYOUT>(fp8_storage, block_size, storage_block_stride_bytes, idx, dim_offset);
-  };
+  const int KBv = std::min(Kv / 32, KB);
   for (int nb = 0; nb < NB; ++nb) {
-    for (int kb = 0; kb < KB; ++kb) {
-      int nb_size = std::min(N - nb * 16, 16);
-      sparse_pack_vnni_Nx32<scalar_t, index_t>(
+    const uint8_t* row_base[16];
+    const uint8_t* scale_base[16];
+    const int nb_size = std::min(N - nb * 16, 16);
+    for (int n = 0; n < nb_size; ++n) {
+      if (!valid_mask[nb * 16 + n]) {
+        row_base[n] = nullptr;
+        scale_base[n] = nullptr;
+        continue;
+      }
+      init_fp8_kvcache_tile_rows<LAYOUT>(
+          fp8_storage,
+          block_size,
+          storage_block_stride_bytes,
+          static_cast<int64_t>(ind[nb * 16 + n]),
+          row_base[n],
+          scale_base[n]);
+    }
+    auto load_vec = [&row_base, &scale_base](int n, int64_t idx, int dim_offset) {
+      UNUSED(idx);
+      return load_fp8_kvcache_32_from_row<LAYOUT>(row_base[n], scale_base[n], dim_offset);
+    };
+    for (int kb = 0; kb < KBv; ++kb) {
+      sparse_pack_vnni_Nx32<true, scalar_t, index_t>(
           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
           /*     ind */ ind + nb * 16,
@@ -367,7 +409,18 @@ void sparse_pack_vnni_fp8(
           /* dim_off */ kb * 32,
           /* ld_dst0 */ ld_dst0,
           /* ld_dst1 */ ld_dst1,
-          /*   cvt_v */ kb < KBv,
+          /* load_vec */ load_vec);
+    }
+    for (int kb = KBv; kb < KB; ++kb) {
+      sparse_pack_vnni_Nx32<false, scalar_t, index_t>(
+          /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
+          /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
+          /*     ind */ ind + nb * 16,
+          /*   valid */ valid_mask + nb * 16,
+          /*       N */ nb_size,
+          /* dim_off */ kb * 32,
+          /* ld_dst0 */ ld_dst0,
+          /* ld_dst1 */ ld_dst1,
           /* load_vec */ load_vec);
     }
   }
