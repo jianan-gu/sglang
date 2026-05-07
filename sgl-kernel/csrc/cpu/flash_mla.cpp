@@ -30,6 +30,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -197,6 +198,33 @@ template <typename index_t>
 inline bool is_valid_sparse_index(index_t idx, int64_t pos, int64_t topk_limit, int64_t total_tokens) {
   const int64_t v = static_cast<int64_t>(idx);
   return pos < topk_limit && v >= 0 && v < total_tokens;
+}
+
+inline int64_t infer_effective_topk_limit(
+    int64_t topk,
+    int64_t batches,
+    const int32_t* __restrict__ topk_length) {
+  if (topk <= 0) {
+    return 0;
+  }
+  if (topk_length == nullptr) {
+    return topk;
+  }
+  int64_t max_limit = 0;
+  for (int64_t b = 0; b < batches; ++b) {
+    max_limit = std::max(max_limit, std::max<int64_t>(0, std::min<int64_t>(topk_length[b], topk)));
+  }
+  return max_limit;
+}
+
+inline int64_t choose_sparse_decode_block_n(int64_t effective_topk_limit) {
+  if (effective_topk_limit <= 32) {
+    return 32;
+  }
+  if (effective_topk_limit <= 64) {
+    return 64;
+  }
+  return 128;
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,16 +1056,27 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
 
   // 3) per-thread B buffer for K (head_size) + V (head_size_v) packing,
   //    plus an f32 V accumulator of size kBLOCK_H_MAX * head_size_v.
-  constexpr int64_t BLOCK_N = 128;  // multiple of 32 for AMX brgemm
+  // Packed K/V tiles are independent of the head block, so cross-head-block
+  // reuse would require hoisting the N-tile loop outside the head-block loop
+  // and keeping per-head-block online-softmax state.  That trades repeated
+  // pack/dequant work for much larger per-thread accumulators and less
+  // head-block parallelism; keep the current parallel schedule and use dynamic
+  // BLOCK_N to reduce work on short effective top-k instead.
+  const int64_t effective_topk_main = infer_effective_topk_limit(topk_main, B, tl_main_ptr);
+  const int64_t effective_topk_extra = infer_effective_topk_limit(topk_extra, B, tl_extra_ptr);
+  const int64_t selected_block_n =
+      choose_sparse_decode_block_n(std::max(effective_topk_main, effective_topk_extra));
   constexpr int64_t kBLOCK_H_MAX = 16;
   TORCH_CHECK(D_qk % 32 == 0, "head_dim_qk must be a multiple of 32");
   TORCH_CHECK(D_v % 32 == 0, "head_dim_v must be a multiple of 32");
 
   const int num_threads = at::get_num_threads();
   // Layout per thread (in bf16 elements):
-  //   [Btmp0 : BLOCK_N * D_qk] [Btmp1 : BLOCK_N * D_v] [v_acc_local : kBLOCK_H_MAX * D_v floats]
+  //   [Btmp0 : selected_block_n * D_qk] [Btmp1 : selected_block_n * D_v]
+  //   [v_acc_local : kBLOCK_H_MAX * D_v floats]
   // f32 takes 2 bf16 elements -> multiply by 2.
-  const int64_t buffer_size_per_thread = BLOCK_N * D_qk + BLOCK_N * D_v + 2 * kBLOCK_H_MAX * D_v;
+  const int64_t buffer_size_per_thread =
+      selected_block_n * D_qk + selected_block_n * D_v + 2 * kBLOCK_H_MAX * D_v;
   auto buffer = at::empty({num_threads, buffer_size_per_thread}, q.options());
 
   // 4) strides
@@ -1049,8 +1088,8 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   const int64_t extra_idx_strideB = has_extra ? extra_indices.value().stride(0) : 0;
   const int64_t extra_idx_strideS = has_extra ? extra_indices.value().stride(1) : 0;
 
-  // 5) dispatch on indices dtype
-  if (indices.scalar_type() == at::kInt) {
+  auto run_int32 = [&](auto block_n_tag) {
+    constexpr int64_t BLOCK_N = decltype(block_n_tag)::value;
     sparse_mla_decode_kernel_impl<at::BFloat16, int32_t, BLOCK_N>(
         out.data_ptr<at::BFloat16>(),
         lse.data_ptr<float>(),
@@ -1090,7 +1129,10 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         extra_idx_strideS,
         static_cast<float>(softmax_scale),
         buffer_size_per_thread);
-  } else {
+  };
+
+  auto run_int64 = [&](auto block_n_tag) {
+    constexpr int64_t BLOCK_N = decltype(block_n_tag)::value;
     sparse_mla_decode_kernel_impl<at::BFloat16, int64_t, BLOCK_N>(
         out.data_ptr<at::BFloat16>(),
         lse.data_ptr<float>(),
@@ -1130,6 +1172,25 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         extra_idx_strideS,
         static_cast<float>(softmax_scale),
         buffer_size_per_thread);
+  };
+
+  // 5) dispatch on indices dtype and dynamic BLOCK_N
+  if (indices.scalar_type() == at::kInt) {
+    if (selected_block_n == 32) {
+      run_int32(std::integral_constant<int64_t, 32>{});
+    } else if (selected_block_n == 64) {
+      run_int32(std::integral_constant<int64_t, 64>{});
+    } else {
+      run_int32(std::integral_constant<int64_t, 128>{});
+    }
+  } else {
+    if (selected_block_n == 32) {
+      run_int64(std::integral_constant<int64_t, 32>{});
+    } else if (selected_block_n == 64) {
+      run_int64(std::integral_constant<int64_t, 64>{});
+    } else {
+      run_int64(std::integral_constant<int64_t, 128>{});
+    }
   }
 
   return std::make_tuple(out, lse);
