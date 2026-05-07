@@ -147,6 +147,44 @@ inline void dequantize_fp8_kvcache_32(
     int64_t storage_block_stride_bytes,
     int64_t token_idx,
     int64_t dim_start) {
+#if defined(CPU_CAPABILITY_AVX512)
+  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
+  constexpr FP8LayoutMeta meta = (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4}
+                                                            : FP8LayoutMeta{512, 448, 64, 64, 7};
+
+  const int64_t b = token_idx / block_size;
+  const int64_t s = token_idx - b * block_size;
+
+  if (dim_start + 32 <= meta.d_nope) {
+    const uint8_t* fp8_ptr;
+    float scale;
+    if constexpr (LAYOUT == kV32FP8Sparse) {
+      constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;
+      const uint8_t* src = fp8_storage + b * storage_block_stride_bytes + s * bytes_per_token;
+      fp8_ptr = src + dim_start;
+      const float* scale_ptr = reinterpret_cast<const float*>(src + meta.d_nope);
+      scale = scale_ptr[dim_start / meta.tile_size];
+    } else {
+      constexpr int64_t nope_rope_per_token = meta.d_nope + 2 * meta.d_rope;
+      constexpr int64_t scale_stride = 8;
+      const uint8_t* block_base = fp8_storage + b * storage_block_stride_bytes;
+      fp8_ptr = block_base + s * nope_rope_per_token + dim_start;
+      const uint8_t* scale_base = block_base + block_size * nope_rope_per_token + s * scale_stride;
+      scale = fp8_e8m0_to_float(scale_base[dim_start / meta.tile_size]);
+    }
+
+    const __m512 vexp = _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS));
+    const __m512 vscale = _mm512_mul_ps(_mm512_set1_ps(scale), vexp);
+    const __m512bh bf16 = CVT_FP8_TO_BF16_EXT(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fp8_ptr)));
+    __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
+    __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
+    f_lo = _mm512_mul_ps(f_lo, vscale);
+    f_hi = _mm512_mul_ps(f_hi, vscale);
+    _mm512_storeu_si512(out, (__m512i)_mm512_cvtne2ps_pbh(f_hi, f_lo));
+    return;
+  }
+#endif
   for (int64_t i = 0; i < 32; ++i) {
     out[i] = dequantize_fp8_kvcache_value<LAYOUT>(
         fp8_storage, block_size, storage_block_stride_bytes, token_idx, dim_start + i);
