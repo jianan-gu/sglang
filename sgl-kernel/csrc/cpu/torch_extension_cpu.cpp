@@ -168,6 +168,21 @@ at::Tensor flash_attn_varlen_func(
     int64_t max_seqlen_k,
     bool causal);
 
+// flash_mla_with_kvcache (DeepSeek FlashMLA sparse decode)
+std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
+    at::Tensor& q,
+    at::Tensor& k_cache,
+    int64_t head_dim_v,
+    double softmax_scale,
+    at::Tensor& indices,
+    std::optional<at::Tensor> topk_length,
+    std::optional<at::Tensor> attn_sink,
+    std::optional<at::Tensor> extra_k_cache,
+    std::optional<at::Tensor> extra_indices,
+    std::optional<at::Tensor> extra_topk_length,
+    bool is_fp8_kvcache,
+    int64_t fp8_layout);
+
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& query,
@@ -646,6 +661,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
       "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
+  // flash mla with kvcache
+  m.def(
+      "flash_mla_with_kvcache_cpu(Tensor q, Tensor k_cache, int head_dim_v, float softmax_scale, "
+      "Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
+      "Tensor? extra_k_cache, Tensor? extra_indices, Tensor? extra_topk_length, "
+      "bool is_fp8_kvcache, int fp8_layout) -> (Tensor, Tensor)");
+  m.impl("flash_mla_with_kvcache_cpu", torch::kCPU, &flash_mla_with_kvcache_cpu);
 
   // linear attn
   m.def(
