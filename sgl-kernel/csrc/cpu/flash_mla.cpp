@@ -103,7 +103,7 @@ struct FP8KVCacheInfo {
 };
 
 FP8KVCacheInfo get_fp8_kvcache_info(at::Tensor k_cache, int64_t layout) {
-  const FP8LayoutMeta meta = get_fp8_meta(layout);
+  get_fp8_meta(layout);
 
   TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, packed_bytes]");
   TORCH_CHECK(k_cache.size(2) == 1, "h_k must be 1 for FlashMLA sparse FP8 path");
