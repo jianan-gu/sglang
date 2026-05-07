@@ -223,70 +223,25 @@ inline __m512i load_fp8_kvcache_32(
   }
 }
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename index_t, typename load_vec_t>
 inline void sparse_pack_vnni_Nx32(
     scalar_t* __restrict__ dst0,
     scalar_t* __restrict__ dst1,
-    const scalar_t* __restrict__ src,
-    const index_t* __restrict__ ind,
-    const bool* __restrict__ valid_mask,
-    int N,
-    int ld_src,
-    int ld_dst0,
-    int ld_dst1,
-    bool convert_v) {
-  __m512i vinputs[16];
-  int n = 0;
-  for (; n < N; ++n) {
-    index_t idx = ind[n];
-    if (!valid_mask[n]) {
-      vinputs[n] = _mm512_set1_epi32(0);
-    } else {
-      vinputs[n] = _mm512_loadu_si512(src + idx * ld_src);
-    }
-  }
-  for (; n < 16; ++n) {
-    vinputs[n] = _mm512_set1_epi32(0);
-  }
-
-  if (convert_v) {
-    for (int nn = 0; nn < 16; nn += 2) {
-      __m512i d0, d1;
-      std::tie(d0, d1) = transpose_2x32_16bit(vinputs[nn], vinputs[nn + 1]);
-      _mm512_storeu_si512(dst1 + (nn >> 1) * ld_dst1 * 2, d0);
-      _mm512_storeu_si512(dst1 + (nn >> 1) * ld_dst1 * 2 + 32, d1);
-    }
-  }
-
-  transpose_16x16_32bit(vinputs);
-  const __mmask16 vmask = (1 << N) - 1;
-  for (int k = 0; k < 16; ++k) {
-    _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
-  }
-}
-
-template <int64_t LAYOUT, typename scalar_t, typename index_t>
-inline void sparse_pack_vnni_fp8_Nx32(
-    scalar_t* __restrict__ dst0,
-    scalar_t* __restrict__ dst1,
-    const uint8_t* __restrict__ fp8_storage,
     const index_t* __restrict__ ind,
     const bool* __restrict__ valid_mask,
     int N,
     int dim_offset,
     int ld_dst0,
     int ld_dst1,
-    int64_t block_size,
-    int64_t storage_block_stride_bytes,
-    bool convert_v) {
+    bool convert_v,
+    const load_vec_t& load_vec) {
   __m512i vinputs[16];
   int n = 0;
   for (; n < N; ++n) {
     if (!valid_mask[n]) {
       vinputs[n] = _mm512_set1_epi32(0);
     } else {
-      vinputs[n] = load_fp8_kvcache_32<LAYOUT>(
-          fp8_storage, block_size, storage_block_stride_bytes, static_cast<int64_t>(ind[n]), dim_offset);
+      vinputs[n] = load_vec(static_cast<int64_t>(ind[n]), dim_offset);
     }
   }
   for (; n < 16; ++n) {
@@ -327,20 +282,23 @@ void sparse_pack_vnni(
   const int NB = div_up(N, 16);
   const int KB = K / 32;
   const int KBv = Kv / 32;
+  auto load_vec = [src, ld_src](int64_t idx, int dim_offset) {
+    return _mm512_loadu_si512(src + idx * ld_src + dim_offset);
+  };
   for (int nb = 0; nb < NB; ++nb) {
     for (int kb = 0; kb < KB; ++kb) {
       int nb_size = std::min(N - nb * 16, 16);
       sparse_pack_vnni_Nx32<scalar_t, index_t>(
           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
-          /*     src */ src + kb * 32,
           /*     ind */ ind + nb * 16,
           /*   valid */ valid_mask + nb * 16,
           /*       N */ nb_size,
-          /*  ld_src */ ld_src,
+          /* dim_off */ kb * 32,
           /* ld_dst0 */ ld_dst0,
           /* ld_dst1 */ ld_dst1,
-          /*   cvt_v */ kb < KBv);
+          /*   cvt_v */ kb < KBv,
+          /* load_vec */ load_vec);
     }
   }
 #else
@@ -394,22 +352,23 @@ void sparse_pack_vnni_fp8(
   const int NB = div_up(N, 16);
   const int KB = K / 32;
   const int KBv = Kv / 32;
+  auto load_vec = [fp8_storage, block_size, storage_block_stride_bytes](int64_t idx, int dim_offset) {
+    return load_fp8_kvcache_32<LAYOUT>(fp8_storage, block_size, storage_block_stride_bytes, idx, dim_offset);
+  };
   for (int nb = 0; nb < NB; ++nb) {
     for (int kb = 0; kb < KB; ++kb) {
       int nb_size = std::min(N - nb * 16, 16);
-      sparse_pack_vnni_fp8_Nx32<LAYOUT, scalar_t, index_t>(
+      sparse_pack_vnni_Nx32<scalar_t, index_t>(
           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
-          /*     src */ fp8_storage,
           /*     ind */ ind + nb * 16,
           /*   valid */ valid_mask + nb * 16,
           /*       N */ nb_size,
           /* dim_off */ kb * 32,
           /* ld_dst0 */ ld_dst0,
           /* ld_dst1 */ ld_dst1,
-          /* blk_sz */ block_size,
-          /* stride */ storage_block_stride_bytes,
-          /*   cvt_v */ kb < KBv);
+          /*   cvt_v */ kb < KBv,
+          /* load_vec */ load_vec);
     }
   }
 #else
