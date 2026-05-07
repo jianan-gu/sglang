@@ -22,8 +22,8 @@
 //   out: (B, S_q, H_q, D_v), bfloat16
 //   lse: (B, H_q, S_q),       float32
 //
-// Parallelism: [batches, S_q, head_blocks, num_kv_splits], identical to the
-// existing CPU MLA decode kernel.
+// Parallelism: BF16 path uses [batches, S_q, head_blocks]; FP8 on-demand path
+// uses [batches, S_q] and reuses each packed K/V tile across head blocks.
 
 #include "common.h"
 #include "gemm.h"
@@ -50,11 +50,8 @@ namespace {
 //     [block_size * 8 bytes                    ; 7 e8m0 scales per token + 1 byte pad]
 //   block stride is padded up to a multiple of 576 bytes.
 //
-// FP8 sparse decode uses a hybrid strategy:
-//   * dequantize the active prefix once when that avoids repeated per-head-block
-//     on-demand dequant work;
-//   * keep on-demand dequant for truly sparse high-index cases where dense
-//     active-prefix materialization would touch many unused tokens.
+// FP8 sparse decode dequantizes indexed rows on demand while packing AMX
+// tiles, and reuses each packed K/V tile across all query head blocks.
 
 enum FP8KVCacheLayout : int64_t {
   kV32FP8Sparse = 1,    // FP8KVCacheLayout.V32_FP8Sparse
@@ -157,116 +154,6 @@ inline void dequantize_fp8_kvcache_32(
   }
 }
 
-template <int64_t LAYOUT>
-void dequantize_fp8_kvcache_impl(
-    at::BFloat16* __restrict__ out,
-    const uint8_t* __restrict__ fp8_storage,
-    int64_t block_size,
-    int64_t active_total_tokens,
-    int64_t storage_block_stride_bytes) {
-  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
-  constexpr FP8LayoutMeta meta = (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4}
-                                                            : FP8LayoutMeta{512, 448, 64, 64, 7};
-
-  if constexpr (LAYOUT == kV32FP8Sparse) {
-    constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;
-
-    at::parallel_for(0, active_total_tokens, /*grain_size*/ 16, [&](int64_t begin, int64_t end) {
-      for (int64_t t = begin; t < end; ++t) {
-        const int64_t b = t / block_size;
-        const int64_t s = t - b * block_size;
-        const uint8_t* src = fp8_storage + b * storage_block_stride_bytes + s * bytes_per_token;
-        at::BFloat16* dst = out + t * meta.d;
-
-        const float* scale_ptr = reinterpret_cast<const float*>(src + meta.d_nope);
-        const at::BFloat16* rope_ptr =
-            reinterpret_cast<const at::BFloat16*>(src + meta.d_nope + meta.num_tiles * 4);
-
-        for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
-          const float sc = scale_ptr[tile];
-          for (int64_t i = 0; i < meta.tile_size; ++i) {
-            const int64_t k = tile * meta.tile_size + i;
-            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(src[k]) * sc);
-          }
-        }
-        for (int64_t k = 0; k < meta.d_rope; ++k) {
-          dst[meta.d_nope + k] = rope_ptr[k];
-        }
-      }
-    });
-  } else {
-    constexpr int64_t nope_rope_per_token = meta.d_nope + 2 * meta.d_rope;
-    constexpr int64_t scale_stride = 8;
-
-    at::parallel_for(0, active_total_tokens, /*grain_size*/ 16, [&](int64_t begin, int64_t end) {
-      for (int64_t t = begin; t < end; ++t) {
-        const int64_t b = t / block_size;
-        const int64_t s = t - b * block_size;
-        const uint8_t* block_base = fp8_storage + b * storage_block_stride_bytes;
-        const uint8_t* nope_rope = block_base + s * nope_rope_per_token;
-        const uint8_t* scale_base = block_base + block_size * nope_rope_per_token + s * scale_stride;
-        at::BFloat16* dst = out + t * meta.d;
-
-        const at::BFloat16* rope_ptr = reinterpret_cast<const at::BFloat16*>(nope_rope + meta.d_nope);
-
-        for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
-          const float sc = fp8_e8m0_to_float(scale_base[tile]);
-          for (int64_t i = 0; i < meta.tile_size; ++i) {
-            const int64_t k = tile * meta.tile_size + i;
-            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(nope_rope[k]) * sc);
-          }
-        }
-        for (int64_t k = 0; k < meta.d_rope; ++k) {
-          dst[meta.d_nope + k] = rope_ptr[k];
-        }
-      }
-    });
-  }
-}
-
-at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout, int64_t active_total_tokens) {
-  const FP8LayoutMeta meta = get_fp8_meta(layout);
-
-  TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, packed_bytes]");
-  TORCH_CHECK(k_cache.size(2) == 1, "h_k must be 1 for FlashMLA sparse FP8 path");
-  TORCH_CHECK(
-      k_cache.dtype() == at::kFloat8_e4m3fn,
-      "flash_mla_with_kvcache_cpu: expect FP8 k_cache to be float8_e4m3fn, got ",
-      k_cache.dtype());
-
-  const int64_t num_blocks = k_cache.size(0);
-  const int64_t block_size = k_cache.size(1);
-  const int64_t capacity = num_blocks * block_size;
-  TORCH_CHECK(
-      active_total_tokens >= 0 && active_total_tokens <= capacity,
-      "flash_mla_with_kvcache_cpu: active_total_tokens (",
-      active_total_tokens,
-      ") must be within KV-cache capacity (",
-      capacity,
-      ")");
-
-  const int64_t storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
-  auto out = at::empty({active_total_tokens, meta.d}, k_cache.options().dtype(at::kBFloat16));
-  const uint8_t* fp8_storage = static_cast<const uint8_t*>(k_cache.data_ptr());
-
-  if (layout == kV32FP8Sparse) {
-    dequantize_fp8_kvcache_impl<kV32FP8Sparse>(
-        out.data_ptr<at::BFloat16>(),
-        fp8_storage,
-        block_size,
-        active_total_tokens,
-        storage_block_stride_bytes);
-  } else {
-    dequantize_fp8_kvcache_impl<kModel1FP8Sparse>(
-        out.data_ptr<at::BFloat16>(),
-        fp8_storage,
-        block_size,
-        active_total_tokens,
-        storage_block_stride_bytes);
-  }
-  return out;
-}
-
 template <typename index_t>
 int64_t infer_active_total_tokens(
     const index_t* __restrict__ indices,
@@ -338,19 +225,6 @@ inline int64_t choose_sparse_decode_block_n(int64_t effective_topk_limit) {
     return 64;
   }
   return 128;
-}
-
-inline bool should_predequantize_fp8_kvcache(
-    int64_t active_total_tokens,
-    int64_t effective_topk_limit,
-    int64_t batches,
-    int64_t s_q,
-    int64_t num_h_blocks) {
-  if (active_total_tokens <= 0 || effective_topk_limit <= 0) {
-    return false;
-  }
-  const int64_t ondemand_rows = batches * s_q * num_h_blocks * effective_topk_limit;
-  return active_total_tokens <= ondemand_rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +861,240 @@ void sparse_mla_decode_kernel_impl(
   });
 }
 
+template <int64_t LAYOUT, typename scalar_t, typename index_t, int64_t BLOCK_N>
+void sparse_mla_decode_fp8_reuse_kernel_impl(
+    scalar_t* __restrict__ output,
+    float* __restrict__ lse_out,
+    const scalar_t* __restrict__ query,
+    const uint8_t* __restrict__ fp8_main,
+    const uint8_t* __restrict__ fp8_extra,
+    const index_t* __restrict__ indices,
+    const index_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ topk_length,
+    const int32_t* __restrict__ extra_topk_length,
+    const float* __restrict__ attn_sink,
+    scalar_t* __restrict__ buffer,
+    int64_t batches,
+    int64_t s_q,
+    int64_t num_heads,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t topk_main,
+    int64_t topk_extra,
+    int64_t total_tokens_main,
+    int64_t total_tokens_extra,
+    int64_t fp8_main_block_size,
+    int64_t fp8_extra_block_size,
+    int64_t fp8_main_storage_block_stride_bytes,
+    int64_t fp8_extra_storage_block_stride_bytes,
+    int64_t q_strideB,
+    int64_t q_strideS,
+    int64_t q_strideH,
+    int64_t idx_strideB,
+    int64_t idx_strideS,
+    int64_t extra_idx_strideB,
+    int64_t extra_idx_strideS,
+    float scaling,
+    int64_t buffer_size_per_thread) {
+  using Vec = at::vec::Vectorized<float>;
+
+  constexpr int64_t kBLOCK_H_MAX = 16;
+  const int64_t BLOCK_H = (batches * s_q) >= 16 ? kBLOCK_H_MAX : 8;
+  const int64_t num_h_blocks = div_up(num_heads, BLOCK_H);
+
+  at::parallel_for(0, batches * s_q, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
+    scalar_t* __restrict__ Btmp0 = buffer + tid * buffer_size_per_thread;        // K packed
+    scalar_t* __restrict__ Btmp1 = Btmp0 + BLOCK_N * head_size;                  // V packed
+    scalar_t* __restrict__ s_delta2 = Btmp1 + BLOCK_N * head_size_v;
+    float* __restrict__ float_buf =
+        reinterpret_cast<float*>(s_delta2 + kBLOCK_H_MAX * BLOCK_N);
+    float* __restrict__ s_i = float_buf;
+    float* __restrict__ s_delta = s_i;
+    float* __restrict__ s_prime = s_i + kBLOCK_H_MAX * BLOCK_N;
+    float* __restrict__ m_prime = s_prime + num_heads;
+    float* __restrict__ v_acc_local = m_prime + num_heads;
+
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t bs = i / s_q;
+      const int64_t sq = i - bs * s_q;
+      const index_t* __restrict__ idx_ptr = indices + bs * idx_strideB + sq * idx_strideS;
+      const index_t* __restrict__ extra_idx_ptr = extra_indices == nullptr
+          ? nullptr
+          : extra_indices + bs * extra_idx_strideB + sq * extra_idx_strideS;
+
+      fmla_fill_stub(s_prime, 0.f, num_heads);
+      fmla_fill_stub(m_prime, -std::numeric_limits<float>::infinity(), num_heads);
+      fmla_fill_stub(v_acc_local, 0.f, num_heads * head_size_v);
+
+      auto process_cache = [&](const uint8_t* __restrict__ fp8_ptr,
+                               const index_t* __restrict__ cur_idx_ptr,
+                               const int32_t* __restrict__ cur_topk_length,
+                               int64_t topk_count,
+                               int64_t total_tokens,
+                               int64_t fp8_block_size,
+                               int64_t fp8_storage_block_stride_bytes) {
+        if (fp8_ptr == nullptr || cur_idx_ptr == nullptr || topk_count == 0) {
+          return;
+        }
+        const int64_t topk_limit = cur_topk_length != nullptr
+            ? std::max<int64_t>(0, std::min<int64_t>(cur_topk_length[bs], topk_count))
+            : topk_count;
+        if (topk_limit == 0) {
+          return;
+        }
+
+        for (int64_t n = 0; n < topk_limit; n += BLOCK_N) {
+          int64_t n_size = std::min<int64_t>(BLOCK_N, topk_limit - n);
+          const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
+          bool valid_mask[BLOCK_N];
+          bool has_valid = false;
+          for (int64_t k = 0; k < n_size; ++k) {
+            const bool valid = is_valid_sparse_index(cur_idx_ptr[n + k], n + k, topk_limit, total_tokens);
+            valid_mask[k] = valid;
+            has_valid |= valid;
+          }
+          if (!has_valid) {
+            continue;
+          }
+
+          sparse_pack_fp8_vnni<LAYOUT, scalar_t, index_t>(
+              /*    dst0 */ Btmp0,
+              /*    dst1 */ Btmp1,
+              /*     src */ fp8_ptr,
+              /*     ind */ cur_idx_ptr + n,
+              /*   valid */ valid_mask,
+              /*       N */ static_cast<int>(n_size),
+              /*       K */ static_cast<int>(head_size),
+              /*      Kv */ static_cast<int>(head_size_v),
+              /* blk_sz  */ fp8_block_size,
+              /* blk_str */ fp8_storage_block_stride_bytes,
+              /* ld_dst0 */ static_cast<int>(BLOCK_N),
+              /* ld_dst1 */ static_cast<int>(head_size_v));
+
+          for (int64_t hb = 0; hb < num_h_blocks; ++hb) {
+            const int64_t h_start = hb * BLOCK_H;
+            const int64_t h_end = std::min(h_start + BLOCK_H, num_heads);
+            const int64_t h_size = h_end - h_start;
+            const scalar_t* __restrict__ q_ptr =
+                query + bs * q_strideB + sq * q_strideS + h_start * q_strideH;
+
+            // Q @ K.  Btmp0/Btmp1 are independent of the query head block, so
+            // this loop reuses one FP8 load/dequant/pack for all head blocks.
+            at::native::cpublas::brgemm(
+                /* M     */ h_size,
+                /* N     */ n_size,
+                /* K     */ head_size,
+                /* lda   */ q_strideH,
+                /* ldb   */ BLOCK_N,
+                /* ldc   */ BLOCK_N,
+                /* add_C */ false,
+                /* A     */ q_ptr,
+                /* B     */ Btmp0,
+                /* C     */ s_i);
+
+            const Vec scale_vec = Vec(scaling);
+            for (int64_t h = 0; h < h_size; ++h) {
+              const int64_t hh = h_start + h;
+              float* row = s_i + h * BLOCK_N;
+              at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, row, row, n_size);
+
+              for (int64_t k = 0; k < n_size; ++k) {
+                if (!valid_mask[k]) {
+                  row[k] = -std::numeric_limits<float>::infinity();
+                }
+              }
+
+              float m_i = at::vec::reduce_all<float>(
+                  [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, row, n_size);
+              m_i = std::max(m_i, m_prime[hh]);
+
+              if (!std::isfinite(m_i)) {
+                fmla_fill_stub(s_delta + h * BLOCK_N, 0.f, padded_n_size);
+                fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
+                continue;
+              }
+
+              const float m_delta = std::exp(m_prime[hh] - m_i);
+              at::vec::map<float>(
+                  [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
+                  s_delta + h * BLOCK_N,
+                  row,
+                  n_size);
+
+              s_prime[hh] *= m_delta;
+              s_prime[hh] += at::vec::reduce_all<float>(
+                  [](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
+              m_prime[hh] = m_i;
+
+              at::vec::map<float>(
+                  [m_delta](Vec x) { return x * Vec(m_delta); },
+                  v_acc_local + hh * head_size_v,
+                  v_acc_local + hh * head_size_v,
+                  head_size_v);
+
+              fmla_fill_stub(s_delta + h * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+              fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
+            }
+
+            at::native::cpublas::brgemm(
+                /* M     */ h_size,
+                /* N     */ head_size_v,
+                /* K     */ padded_n_size,
+                /* lda   */ BLOCK_N,
+                /* ldb   */ head_size_v,
+                /* ldc   */ head_size_v,
+                /* add_C */ true,
+                /* A     */ s_delta2,
+                /* B     */ Btmp1,
+                /* C     */ v_acc_local + h_start * head_size_v);
+          }
+        }
+      };
+
+      process_cache(
+          fp8_main,
+          idx_ptr,
+          topk_length,
+          topk_main,
+          total_tokens_main,
+          fp8_main_block_size,
+          fp8_main_storage_block_stride_bytes);
+      process_cache(
+          fp8_extra,
+          extra_idx_ptr,
+          extra_topk_length,
+          topk_extra,
+          total_tokens_extra,
+          fp8_extra_block_size,
+          fp8_extra_storage_block_stride_bytes);
+
+      for (int64_t hh = 0; hh < num_heads; ++hh) {
+        const bool lonely = !std::isfinite(m_prime[hh]) || s_prime[hh] == 0.f;
+        float lse_val = lonely ? std::numeric_limits<float>::infinity()
+                                : (m_prime[hh] + std::log(s_prime[hh]));
+        float inv_s = lonely ? 0.f : (1.f / s_prime[hh]);
+
+        if (!lonely && attn_sink != nullptr) {
+          const float sink = attn_sink[hh];
+          const float corr = 1.f / (1.f + std::exp(sink - lse_val));
+          inv_s *= corr;
+        }
+
+        scalar_t* out_row = output + bs * (s_q * num_heads * head_size_v)
+            + sq * (num_heads * head_size_v) + hh * head_size_v;
+        if (lonely) {
+          fmla_fill_stub(out_row, 0.f, head_size_v);
+        } else {
+          fmla_finalize_out<scalar_t>(out_row, v_acc_local + hh * head_size_v, inv_s, head_size_v);
+        }
+        lse_out[bs * num_heads * s_q + hh * s_q + sq] = lse_val;
+      }
+    }
+    at::native::cpublas::brgemm_release();
+  });
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1108,15 +1216,11 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   }
 
   constexpr int64_t kBLOCK_H_MAX = 16;
-  const int64_t block_h = (B * S_q) >= 16 ? kBLOCK_H_MAX : 8;
-  const int64_t num_h_blocks = div_up(H_q, block_h);
   const int64_t effective_topk_main = infer_effective_topk_limit(topk_main, B, tl_main_ptr);
   const int64_t effective_topk_extra = infer_effective_topk_limit(topk_extra, B, tl_extra_ptr);
   const int64_t selected_block_n =
       choose_sparse_decode_block_n(std::max(effective_topk_main, effective_topk_extra));
 
-  at::Tensor k_dequant_main;
-  at::Tensor k_dequant_extra;
   const at::BFloat16* k_main_ptr = nullptr;
   const at::BFloat16* k_extra_ptr = nullptr;
   const uint8_t* fp8_main_ptr = nullptr;
@@ -1146,16 +1250,9 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         ? meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2
         : meta.d_nope + meta.num_tiles + 1 + meta.d_rope * 2;
     CHECK_EQ(k_cache.size(3), fp8_bytes_per_token);
-    if (should_predequantize_fp8_kvcache(
-            total_tokens_main, effective_topk_main, B, S_q, num_h_blocks)) {
-      k_dequant_main = dequantize_fp8_kvcache(k_cache, fp8_layout, total_tokens_main);
-      k_main_ptr = k_dequant_main.data_ptr<at::BFloat16>();
-      k_main_strideN = k_dequant_main.stride(0);
-    } else {
-      fp8_main_ptr = static_cast<const uint8_t*>(k_cache.data_ptr());
-      fp8_main_block_size = k_cache.size(1);
-      fp8_main_storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
-    }
+    fp8_main_ptr = static_cast<const uint8_t*>(k_cache.data_ptr());
+    fp8_main_block_size = k_cache.size(1);
+    fp8_main_storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
 
     if (has_extra) {
       const at::Tensor& extra = extra_k_cache.value();
@@ -1165,16 +1262,9 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
           extra.dtype());
       CHECK_EQ(extra.size(2), 1);
       CHECK_EQ(extra.size(3), fp8_bytes_per_token);
-      if (should_predequantize_fp8_kvcache(
-              total_tokens_extra, effective_topk_extra, B, S_q, num_h_blocks)) {
-        k_dequant_extra = dequantize_fp8_kvcache(extra, fp8_layout, total_tokens_extra);
-        k_extra_ptr = k_dequant_extra.data_ptr<at::BFloat16>();
-        k_extra_strideN = k_dequant_extra.stride(0);
-      } else {
-        fp8_extra_ptr = static_cast<const uint8_t*>(extra.data_ptr());
-        fp8_extra_block_size = extra.size(1);
-        fp8_extra_storage_block_stride_bytes = extra.stride(0) * extra.element_size();
-      }
+      fp8_extra_ptr = static_cast<const uint8_t*>(extra.data_ptr());
+      fp8_extra_block_size = extra.size(1);
+      fp8_extra_storage_block_stride_bytes = extra.stride(0) * extra.element_size();
     }
   } else {
     TORCH_CHECK(
@@ -1204,22 +1294,15 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   auto out = at::empty({B, S_q, H_q, D_v}, q.options());
   auto lse = at::empty({B, H_q, S_q}, q.options().dtype(at::kFloat));
 
-  // 3) per-thread B buffer for K (head_size) + V (head_size_v) packing,
-  //    plus an f32 V accumulator of size kBLOCK_H_MAX * head_size_v.
-  // Reuse dense-prefix FP8 dequantization for cases where on-demand dequant
-  // would repeat the same sparse rows across multiple head blocks; keep
-  // on-demand only for sparse high-index cases where it avoids large unused
-  // active-prefix materialization.
+  // 3) per-thread packing and accumulator buffers.
   TORCH_CHECK(D_qk % 32 == 0, "head_dim_qk must be a multiple of 32");
   TORCH_CHECK(D_v % 32 == 0, "head_dim_v must be a multiple of 32");
 
   const int num_threads = at::get_num_threads();
-  // Layout per thread (in bf16 elements):
-  //   [Btmp0 : selected_block_n * D_qk] [Btmp1 : selected_block_n * D_v]
-  //   [v_acc_local : kBLOCK_H_MAX * D_v floats]
-  // f32 takes 2 bf16 elements -> multiply by 2.
-  const int64_t buffer_size_per_thread =
-      selected_block_n * D_qk + selected_block_n * D_v + 2 * kBLOCK_H_MAX * D_v;
+  const int64_t buffer_size_per_thread = is_fp8_kvcache
+      ? selected_block_n * D_qk + selected_block_n * D_v + kBLOCK_H_MAX * selected_block_n +
+          2 * (kBLOCK_H_MAX * selected_block_n + 2 * H_q + H_q * D_v)
+      : selected_block_n * D_qk + selected_block_n * D_v + 2 * kBLOCK_H_MAX * D_v;
   auto buffer = at::empty({num_threads, buffer_size_per_thread}, q.options());
 
   // 4) strides
@@ -1233,88 +1316,178 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
 
   auto run_int32 = [&](auto block_n_tag) {
     constexpr int64_t BLOCK_N = decltype(block_n_tag)::value;
-    sparse_mla_decode_kernel_impl<at::BFloat16, int32_t, BLOCK_N>(
-        out.data_ptr<at::BFloat16>(),
-        lse.data_ptr<float>(),
-        q.data_ptr<at::BFloat16>(),
-        k_main_ptr,
-        k_extra_ptr,
-        fp8_main_ptr,
-        fp8_extra_ptr,
-        indices.data_ptr<int32_t>(),
-        has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
-        tl_main_ptr,
-        tl_extra_ptr,
-        attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
-        buffer.data_ptr<at::BFloat16>(),
-        B,
-        S_q,
-        H_q,
-        D_qk,
-        D_v,
-        topk_main,
-        topk_extra,
-        total_tokens_main,
-        total_tokens_extra,
-        is_fp8_kvcache ? fp8_layout : 0,
-        fp8_main_block_size,
-        fp8_extra_block_size,
-        fp8_main_storage_block_stride_bytes,
-        fp8_extra_storage_block_stride_bytes,
-        q_strideB,
-        q_strideS,
-        q_strideH,
-        k_main_strideN,
-        k_extra_strideN,
-        idx_strideB,
-        idx_strideS,
-        extra_idx_strideB,
-        extra_idx_strideS,
-        static_cast<float>(softmax_scale),
-        buffer_size_per_thread);
+    if (is_fp8_kvcache) {
+      auto run_fp8_layout = [&](auto layout_tag) {
+        constexpr int64_t LAYOUT = decltype(layout_tag)::value;
+        sparse_mla_decode_fp8_reuse_kernel_impl<LAYOUT, at::BFloat16, int32_t, BLOCK_N>(
+            out.data_ptr<at::BFloat16>(),
+            lse.data_ptr<float>(),
+            q.data_ptr<at::BFloat16>(),
+            fp8_main_ptr,
+            fp8_extra_ptr,
+            indices.data_ptr<int32_t>(),
+            has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
+            tl_main_ptr,
+            tl_extra_ptr,
+            attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
+            buffer.data_ptr<at::BFloat16>(),
+            B,
+            S_q,
+            H_q,
+            D_qk,
+            D_v,
+            topk_main,
+            topk_extra,
+            total_tokens_main,
+            total_tokens_extra,
+            fp8_main_block_size,
+            fp8_extra_block_size,
+            fp8_main_storage_block_stride_bytes,
+            fp8_extra_storage_block_stride_bytes,
+            q_strideB,
+            q_strideS,
+            q_strideH,
+            idx_strideB,
+            idx_strideS,
+            extra_idx_strideB,
+            extra_idx_strideS,
+            static_cast<float>(softmax_scale),
+            buffer_size_per_thread);
+      };
+      if (fp8_layout == kV32FP8Sparse) {
+        run_fp8_layout(std::integral_constant<int64_t, kV32FP8Sparse>{});
+      } else {
+        run_fp8_layout(std::integral_constant<int64_t, kModel1FP8Sparse>{});
+      }
+    } else {
+      sparse_mla_decode_kernel_impl<at::BFloat16, int32_t, BLOCK_N>(
+          out.data_ptr<at::BFloat16>(),
+          lse.data_ptr<float>(),
+          q.data_ptr<at::BFloat16>(),
+          k_main_ptr,
+          k_extra_ptr,
+          nullptr,
+          nullptr,
+          indices.data_ptr<int32_t>(),
+          has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
+          tl_main_ptr,
+          tl_extra_ptr,
+          attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
+          buffer.data_ptr<at::BFloat16>(),
+          B,
+          S_q,
+          H_q,
+          D_qk,
+          D_v,
+          topk_main,
+          topk_extra,
+          total_tokens_main,
+          total_tokens_extra,
+          0,
+          0,
+          0,
+          0,
+          0,
+          q_strideB,
+          q_strideS,
+          q_strideH,
+          k_main_strideN,
+          k_extra_strideN,
+          idx_strideB,
+          idx_strideS,
+          extra_idx_strideB,
+          extra_idx_strideS,
+          static_cast<float>(softmax_scale),
+          buffer_size_per_thread);
+    }
   };
 
   auto run_int64 = [&](auto block_n_tag) {
     constexpr int64_t BLOCK_N = decltype(block_n_tag)::value;
-    sparse_mla_decode_kernel_impl<at::BFloat16, int64_t, BLOCK_N>(
-        out.data_ptr<at::BFloat16>(),
-        lse.data_ptr<float>(),
-        q.data_ptr<at::BFloat16>(),
-        k_main_ptr,
-        k_extra_ptr,
-        fp8_main_ptr,
-        fp8_extra_ptr,
-        indices.data_ptr<int64_t>(),
-        has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
-        tl_main_ptr,
-        tl_extra_ptr,
-        attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
-        buffer.data_ptr<at::BFloat16>(),
-        B,
-        S_q,
-        H_q,
-        D_qk,
-        D_v,
-        topk_main,
-        topk_extra,
-        total_tokens_main,
-        total_tokens_extra,
-        is_fp8_kvcache ? fp8_layout : 0,
-        fp8_main_block_size,
-        fp8_extra_block_size,
-        fp8_main_storage_block_stride_bytes,
-        fp8_extra_storage_block_stride_bytes,
-        q_strideB,
-        q_strideS,
-        q_strideH,
-        k_main_strideN,
-        k_extra_strideN,
-        idx_strideB,
-        idx_strideS,
-        extra_idx_strideB,
-        extra_idx_strideS,
-        static_cast<float>(softmax_scale),
-        buffer_size_per_thread);
+    if (is_fp8_kvcache) {
+      auto run_fp8_layout = [&](auto layout_tag) {
+        constexpr int64_t LAYOUT = decltype(layout_tag)::value;
+        sparse_mla_decode_fp8_reuse_kernel_impl<LAYOUT, at::BFloat16, int64_t, BLOCK_N>(
+            out.data_ptr<at::BFloat16>(),
+            lse.data_ptr<float>(),
+            q.data_ptr<at::BFloat16>(),
+            fp8_main_ptr,
+            fp8_extra_ptr,
+            indices.data_ptr<int64_t>(),
+            has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
+            tl_main_ptr,
+            tl_extra_ptr,
+            attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
+            buffer.data_ptr<at::BFloat16>(),
+            B,
+            S_q,
+            H_q,
+            D_qk,
+            D_v,
+            topk_main,
+            topk_extra,
+            total_tokens_main,
+            total_tokens_extra,
+            fp8_main_block_size,
+            fp8_extra_block_size,
+            fp8_main_storage_block_stride_bytes,
+            fp8_extra_storage_block_stride_bytes,
+            q_strideB,
+            q_strideS,
+            q_strideH,
+            idx_strideB,
+            idx_strideS,
+            extra_idx_strideB,
+            extra_idx_strideS,
+            static_cast<float>(softmax_scale),
+            buffer_size_per_thread);
+      };
+      if (fp8_layout == kV32FP8Sparse) {
+        run_fp8_layout(std::integral_constant<int64_t, kV32FP8Sparse>{});
+      } else {
+        run_fp8_layout(std::integral_constant<int64_t, kModel1FP8Sparse>{});
+      }
+    } else {
+      sparse_mla_decode_kernel_impl<at::BFloat16, int64_t, BLOCK_N>(
+          out.data_ptr<at::BFloat16>(),
+          lse.data_ptr<float>(),
+          q.data_ptr<at::BFloat16>(),
+          k_main_ptr,
+          k_extra_ptr,
+          nullptr,
+          nullptr,
+          indices.data_ptr<int64_t>(),
+          has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
+          tl_main_ptr,
+          tl_extra_ptr,
+          attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
+          buffer.data_ptr<at::BFloat16>(),
+          B,
+          S_q,
+          H_q,
+          D_qk,
+          D_v,
+          topk_main,
+          topk_extra,
+          total_tokens_main,
+          total_tokens_extra,
+          0,
+          0,
+          0,
+          0,
+          0,
+          q_strideB,
+          q_strideS,
+          q_strideH,
+          k_main_strideN,
+          k_extra_strideN,
+          idx_strideB,
+          idx_strideS,
+          extra_idx_strideB,
+          extra_idx_strideS,
+          static_cast<float>(softmax_scale),
+          buffer_size_per_thread);
+    }
   };
 
   // 5) dispatch on indices dtype and dynamic BLOCK_N
