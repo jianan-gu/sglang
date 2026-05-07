@@ -23,7 +23,8 @@
 //   lse: (B, H_q, S_q),       float32
 //
 // Parallelism: BF16 path uses [batches, S_q, head_blocks]; FP8 on-demand path
-// uses [batches, S_q] and reuses each packed K/V tile across head blocks.
+// uses [batches, heads, S_q blocks] to expose more parallel work without dense
+// active-prefix dequantization.
 
 #include "common.h"
 #include "gemm.h"
@@ -51,7 +52,8 @@ namespace {
 //   block stride is padded up to a multiple of 576 bytes.
 //
 // FP8 sparse decode dequantizes indexed rows on demand while packing AMX
-// tiles, and reuses each packed K/V tile across all query head blocks.
+// tiles.  It keeps the cache loads in FP8 form and avoids active-prefix BF16
+// materialization.
 
 enum FP8KVCacheLayout : int64_t {
   kV32FP8Sparse = 1,    // FP8KVCacheLayout.V32_FP8Sparse
@@ -898,91 +900,88 @@ void sparse_mla_decode_fp8_reuse_kernel_impl(
     int64_t buffer_size_per_thread) {
   using Vec = at::vec::Vectorized<float>;
 
-  constexpr int64_t kBLOCK_H_MAX = 16;
-  const int64_t BLOCK_H = (batches * s_q) >= 16 ? kBLOCK_H_MAX : 8;
-  const int64_t num_h_blocks = div_up(num_heads, BLOCK_H);
+  constexpr int64_t BLOCK_S_Q = 4;
+  const int64_t num_sq_blocks = div_up(s_q, BLOCK_S_Q);
 
-  at::parallel_for(0, batches * s_q, 0, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, batches * num_heads * num_sq_blocks, 0, [&](int64_t begin, int64_t end) {
     int tid = at::get_thread_num();
     scalar_t* __restrict__ Btmp0 = buffer + tid * buffer_size_per_thread;        // K packed
     scalar_t* __restrict__ Btmp1 = Btmp0 + BLOCK_N * head_size;                  // V packed
     scalar_t* __restrict__ s_delta2 = Btmp1 + BLOCK_N * head_size_v;
-    float* __restrict__ float_buf =
-        reinterpret_cast<float*>(s_delta2 + kBLOCK_H_MAX * BLOCK_N);
+    float* __restrict__ float_buf = reinterpret_cast<float*>(s_delta2 + BLOCK_N);
     float* __restrict__ s_i = float_buf;
     float* __restrict__ s_delta = s_i;
-    float* __restrict__ s_prime = s_i + kBLOCK_H_MAX * BLOCK_N;
-    float* __restrict__ m_prime = s_prime + num_heads;
-    float* __restrict__ v_acc_local = m_prime + num_heads;
+    float* __restrict__ v_acc_local = s_i + BLOCK_N;
 
     for (int64_t i = begin; i < end; ++i) {
-      const int64_t bs = i / s_q;
-      const int64_t sq = i - bs * s_q;
-      const index_t* __restrict__ idx_ptr = indices + bs * idx_strideB + sq * idx_strideS;
-      const index_t* __restrict__ extra_idx_ptr = extra_indices == nullptr
-          ? nullptr
-          : extra_indices + bs * extra_idx_strideB + sq * extra_idx_strideS;
+      const int64_t sq_block = i % num_sq_blocks;
+      const int64_t tmp = i / num_sq_blocks;
+      const int64_t hh = tmp % num_heads;
+      const int64_t bs = tmp / num_heads;
+      const int64_t sq_begin = sq_block * BLOCK_S_Q;
+      const int64_t sq_end = std::min(sq_begin + BLOCK_S_Q, s_q);
 
-      fmla_fill_stub(s_prime, 0.f, num_heads);
-      fmla_fill_stub(m_prime, -std::numeric_limits<float>::infinity(), num_heads);
-      fmla_fill_stub(v_acc_local, 0.f, num_heads * head_size_v);
+      for (int64_t sq = sq_begin; sq < sq_end; ++sq) {
+        const index_t* __restrict__ idx_ptr = indices + bs * idx_strideB + sq * idx_strideS;
+        const index_t* __restrict__ extra_idx_ptr = extra_indices == nullptr
+            ? nullptr
+            : extra_indices + bs * extra_idx_strideB + sq * extra_idx_strideS;
+        const scalar_t* __restrict__ q_ptr = query + bs * q_strideB + sq * q_strideS + hh * q_strideH;
 
-      auto process_cache = [&](const uint8_t* __restrict__ fp8_ptr,
-                               const index_t* __restrict__ cur_idx_ptr,
-                               const int32_t* __restrict__ cur_topk_length,
-                               int64_t topk_count,
-                               int64_t total_tokens,
-                               int64_t fp8_block_size,
-                               int64_t fp8_storage_block_stride_bytes) {
-        if (fp8_ptr == nullptr || cur_idx_ptr == nullptr || topk_count == 0) {
-          return;
-        }
-        const int64_t topk_limit = cur_topk_length != nullptr
-            ? std::max<int64_t>(0, std::min<int64_t>(cur_topk_length[bs], topk_count))
-            : topk_count;
-        if (topk_limit == 0) {
-          return;
-        }
+        float s_prime = 0.f;
+        float m_prime = -std::numeric_limits<float>::infinity();
+        fmla_fill_stub(v_acc_local, 0.f, head_size_v);
 
-        for (int64_t n = 0; n < topk_limit; n += BLOCK_N) {
-          int64_t n_size = std::min<int64_t>(BLOCK_N, topk_limit - n);
-          const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
-          bool valid_mask[BLOCK_N];
-          bool has_valid = false;
-          for (int64_t k = 0; k < n_size; ++k) {
-            const bool valid = is_valid_sparse_index(cur_idx_ptr[n + k], n + k, topk_limit, total_tokens);
-            valid_mask[k] = valid;
-            has_valid |= valid;
+        auto process_cache = [&](const uint8_t* __restrict__ fp8_ptr,
+                                 const index_t* __restrict__ cur_idx_ptr,
+                                 const int32_t* __restrict__ cur_topk_length,
+                                 int64_t topk_count,
+                                 int64_t total_tokens,
+                                 int64_t fp8_block_size,
+                                 int64_t fp8_storage_block_stride_bytes) {
+          if (fp8_ptr == nullptr || cur_idx_ptr == nullptr || topk_count == 0) {
+            return;
           }
-          if (!has_valid) {
-            continue;
+          const int64_t topk_limit = cur_topk_length != nullptr
+              ? std::max<int64_t>(0, std::min<int64_t>(cur_topk_length[bs], topk_count))
+              : topk_count;
+          if (topk_limit == 0) {
+            return;
           }
 
-          sparse_pack_fp8_vnni<LAYOUT, scalar_t, index_t>(
-              /*    dst0 */ Btmp0,
-              /*    dst1 */ Btmp1,
-              /*     src */ fp8_ptr,
-              /*     ind */ cur_idx_ptr + n,
-              /*   valid */ valid_mask,
-              /*       N */ static_cast<int>(n_size),
-              /*       K */ static_cast<int>(head_size),
-              /*      Kv */ static_cast<int>(head_size_v),
-              /* blk_sz  */ fp8_block_size,
-              /* blk_str */ fp8_storage_block_stride_bytes,
-              /* ld_dst0 */ static_cast<int>(BLOCK_N),
-              /* ld_dst1 */ static_cast<int>(head_size_v));
+          for (int64_t n = 0; n < topk_limit; n += BLOCK_N) {
+            int64_t n_size = std::min<int64_t>(BLOCK_N, topk_limit - n);
+            const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
+            bool valid_mask[BLOCK_N];
+            bool has_valid = false;
+            for (int64_t k = 0; k < n_size; ++k) {
+              const bool valid = is_valid_sparse_index(cur_idx_ptr[n + k], n + k, topk_limit, total_tokens);
+              valid_mask[k] = valid;
+              has_valid |= valid;
+            }
+            if (!has_valid) {
+              continue;
+            }
 
-          for (int64_t hb = 0; hb < num_h_blocks; ++hb) {
-            const int64_t h_start = hb * BLOCK_H;
-            const int64_t h_end = std::min(h_start + BLOCK_H, num_heads);
-            const int64_t h_size = h_end - h_start;
-            const scalar_t* __restrict__ q_ptr =
-                query + bs * q_strideB + sq * q_strideS + h_start * q_strideH;
+            // Packing is per (B, head, S_q block) thread.  Indices are
+            // per-query, so there is no safe cross-thread K/V tile reuse here
+            // without synchronization or a shared packed-cache lifetime.
+            sparse_pack_fp8_vnni<LAYOUT, scalar_t, index_t>(
+                /*    dst0 */ Btmp0,
+                /*    dst1 */ Btmp1,
+                /*     src */ fp8_ptr,
+                /*     ind */ cur_idx_ptr + n,
+                /*   valid */ valid_mask,
+                /*       N */ static_cast<int>(n_size),
+                /*       K */ static_cast<int>(head_size),
+                /*      Kv */ static_cast<int>(head_size_v),
+                /* blk_sz  */ fp8_block_size,
+                /* blk_str */ fp8_storage_block_stride_bytes,
+                /* ld_dst0 */ static_cast<int>(BLOCK_N),
+                /* ld_dst1 */ static_cast<int>(head_size_v));
 
-            // Q @ K.  Btmp0/Btmp1 are independent of the query head block, so
-            // this loop reuses one FP8 load/dequant/pack for all head blocks.
             at::native::cpublas::brgemm(
-                /* M     */ h_size,
+                /* M     */ 1,
                 /* N     */ n_size,
                 /* K     */ head_size,
                 /* lda   */ q_strideH,
@@ -994,51 +993,40 @@ void sparse_mla_decode_fp8_reuse_kernel_impl(
                 /* C     */ s_i);
 
             const Vec scale_vec = Vec(scaling);
-            for (int64_t h = 0; h < h_size; ++h) {
-              const int64_t hh = h_start + h;
-              float* row = s_i + h * BLOCK_N;
-              at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, row, row, n_size);
-
-              for (int64_t k = 0; k < n_size; ++k) {
-                if (!valid_mask[k]) {
-                  row[k] = -std::numeric_limits<float>::infinity();
-                }
+            at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, s_i, s_i, n_size);
+            for (int64_t k = 0; k < n_size; ++k) {
+              if (!valid_mask[k]) {
+                s_i[k] = -std::numeric_limits<float>::infinity();
               }
-
-              float m_i = at::vec::reduce_all<float>(
-                  [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, row, n_size);
-              m_i = std::max(m_i, m_prime[hh]);
-
-              if (!std::isfinite(m_i)) {
-                fmla_fill_stub(s_delta + h * BLOCK_N, 0.f, padded_n_size);
-                fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
-                continue;
-              }
-
-              const float m_delta = std::exp(m_prime[hh] - m_i);
-              at::vec::map<float>(
-                  [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
-                  s_delta + h * BLOCK_N,
-                  row,
-                  n_size);
-
-              s_prime[hh] *= m_delta;
-              s_prime[hh] += at::vec::reduce_all<float>(
-                  [](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
-              m_prime[hh] = m_i;
-
-              at::vec::map<float>(
-                  [m_delta](Vec x) { return x * Vec(m_delta); },
-                  v_acc_local + hh * head_size_v,
-                  v_acc_local + hh * head_size_v,
-                  head_size_v);
-
-              fmla_fill_stub(s_delta + h * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-              fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
             }
 
+            float m_i = at::vec::reduce_all<float>(
+                [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i, n_size);
+            m_i = std::max(m_i, m_prime);
+
+            if (!std::isfinite(m_i)) {
+              fmla_fill_stub(s_delta, 0.f, padded_n_size);
+              fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2, s_delta);
+              continue;
+            }
+
+            const float m_delta = std::exp(m_prime - m_i);
+            at::vec::map<float>(
+                [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta, s_i, n_size);
+
+            s_prime *= m_delta;
+            s_prime += at::vec::reduce_all<float>(
+                [](Vec& x, Vec& y) { return x + y; }, s_delta, n_size);
+            m_prime = m_i;
+
+            at::vec::map<float>(
+                [m_delta](Vec x) { return x * Vec(m_delta); }, v_acc_local, v_acc_local, head_size_v);
+
+            fmla_fill_stub(s_delta + n_size, 0.f, padded_n_size - n_size);
+            fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2, s_delta);
+
             at::native::cpublas::brgemm(
-                /* M     */ h_size,
+                /* M     */ 1,
                 /* N     */ head_size_v,
                 /* K     */ padded_n_size,
                 /* lda   */ BLOCK_N,
@@ -1047,33 +1035,30 @@ void sparse_mla_decode_fp8_reuse_kernel_impl(
                 /* add_C */ true,
                 /* A     */ s_delta2,
                 /* B     */ Btmp1,
-                /* C     */ v_acc_local + h_start * head_size_v);
+                /* C     */ v_acc_local);
           }
-        }
-      };
+        };
 
-      process_cache(
-          fp8_main,
-          idx_ptr,
-          topk_length,
-          topk_main,
-          total_tokens_main,
-          fp8_main_block_size,
-          fp8_main_storage_block_stride_bytes);
-      process_cache(
-          fp8_extra,
-          extra_idx_ptr,
-          extra_topk_length,
-          topk_extra,
-          total_tokens_extra,
-          fp8_extra_block_size,
-          fp8_extra_storage_block_stride_bytes);
+        process_cache(
+            fp8_main,
+            idx_ptr,
+            topk_length,
+            topk_main,
+            total_tokens_main,
+            fp8_main_block_size,
+            fp8_main_storage_block_stride_bytes);
+        process_cache(
+            fp8_extra,
+            extra_idx_ptr,
+            extra_topk_length,
+            topk_extra,
+            total_tokens_extra,
+            fp8_extra_block_size,
+            fp8_extra_storage_block_stride_bytes);
 
-      for (int64_t hh = 0; hh < num_heads; ++hh) {
-        const bool lonely = !std::isfinite(m_prime[hh]) || s_prime[hh] == 0.f;
-        float lse_val = lonely ? std::numeric_limits<float>::infinity()
-                                : (m_prime[hh] + std::log(s_prime[hh]));
-        float inv_s = lonely ? 0.f : (1.f / s_prime[hh]);
+        const bool lonely = !std::isfinite(m_prime) || s_prime == 0.f;
+        float lse_val = lonely ? std::numeric_limits<float>::infinity() : (m_prime + std::log(s_prime));
+        float inv_s = lonely ? 0.f : (1.f / s_prime);
 
         if (!lonely && attn_sink != nullptr) {
           const float sink = attn_sink[hh];
@@ -1086,7 +1071,7 @@ void sparse_mla_decode_fp8_reuse_kernel_impl(
         if (lonely) {
           fmla_fill_stub(out_row, 0.f, head_size_v);
         } else {
-          fmla_finalize_out<scalar_t>(out_row, v_acc_local + hh * head_size_v, inv_s, head_size_v);
+          fmla_finalize_out<scalar_t>(out_row, v_acc_local, inv_s, head_size_v);
         }
         lse_out[bs * num_heads * s_q + hh * s_q + sq] = lse_val;
       }
@@ -1215,7 +1200,6 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     }
   }
 
-  constexpr int64_t kBLOCK_H_MAX = 16;
   const int64_t effective_topk_main = infer_effective_topk_limit(topk_main, B, tl_main_ptr);
   const int64_t effective_topk_extra = infer_effective_topk_limit(topk_extra, B, tl_extra_ptr);
   const int64_t selected_block_n =
@@ -1299,9 +1283,10 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   TORCH_CHECK(D_v % 32 == 0, "head_dim_v must be a multiple of 32");
 
   const int num_threads = at::get_num_threads();
+  constexpr int64_t kBLOCK_H_MAX = 16;
   const int64_t buffer_size_per_thread = is_fp8_kvcache
-      ? selected_block_n * D_qk + selected_block_n * D_v + kBLOCK_H_MAX * selected_block_n +
-          2 * (kBLOCK_H_MAX * selected_block_n + 2 * H_q + H_q * D_v)
+      ? selected_block_n * D_qk + selected_block_n * D_v + selected_block_n +
+          2 * (selected_block_n + D_v)
       : selected_block_n * D_qk + selected_block_n * D_v + 2 * kBLOCK_H_MAX * D_v;
   auto buffer = at::empty({num_threads, buffer_size_per_thread}, q.options());
 
