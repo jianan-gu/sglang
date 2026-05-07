@@ -50,8 +50,11 @@ namespace {
 //     [block_size * 8 bytes                    ; 7 e8m0 scales per token + 1 byte pad]
 //   block stride is padded up to a multiple of 576 bytes.
 //
-// FP8 sparse decode dequantizes indexed rows on demand while packing AMX
-// tiles, avoiding an active-prefix BF16 KV buffer when indices are sparse.
+// FP8 sparse decode uses a hybrid strategy:
+//   * dequantize the active prefix once when that avoids repeated per-head-block
+//     on-demand dequant work;
+//   * keep on-demand dequant for truly sparse high-index cases where dense
+//     active-prefix materialization would touch many unused tokens.
 
 enum FP8KVCacheLayout : int64_t {
   kV32FP8Sparse = 1,    // FP8KVCacheLayout.V32_FP8Sparse
@@ -154,6 +157,116 @@ inline void dequantize_fp8_kvcache_32(
   }
 }
 
+template <int64_t LAYOUT>
+void dequantize_fp8_kvcache_impl(
+    at::BFloat16* __restrict__ out,
+    const uint8_t* __restrict__ fp8_storage,
+    int64_t block_size,
+    int64_t active_total_tokens,
+    int64_t storage_block_stride_bytes) {
+  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
+  constexpr FP8LayoutMeta meta = (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4}
+                                                            : FP8LayoutMeta{512, 448, 64, 64, 7};
+
+  if constexpr (LAYOUT == kV32FP8Sparse) {
+    constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;
+
+    at::parallel_for(0, active_total_tokens, /*grain_size*/ 16, [&](int64_t begin, int64_t end) {
+      for (int64_t t = begin; t < end; ++t) {
+        const int64_t b = t / block_size;
+        const int64_t s = t - b * block_size;
+        const uint8_t* src = fp8_storage + b * storage_block_stride_bytes + s * bytes_per_token;
+        at::BFloat16* dst = out + t * meta.d;
+
+        const float* scale_ptr = reinterpret_cast<const float*>(src + meta.d_nope);
+        const at::BFloat16* rope_ptr =
+            reinterpret_cast<const at::BFloat16*>(src + meta.d_nope + meta.num_tiles * 4);
+
+        for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
+          const float sc = scale_ptr[tile];
+          for (int64_t i = 0; i < meta.tile_size; ++i) {
+            const int64_t k = tile * meta.tile_size + i;
+            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(src[k]) * sc);
+          }
+        }
+        for (int64_t k = 0; k < meta.d_rope; ++k) {
+          dst[meta.d_nope + k] = rope_ptr[k];
+        }
+      }
+    });
+  } else {
+    constexpr int64_t nope_rope_per_token = meta.d_nope + 2 * meta.d_rope;
+    constexpr int64_t scale_stride = 8;
+
+    at::parallel_for(0, active_total_tokens, /*grain_size*/ 16, [&](int64_t begin, int64_t end) {
+      for (int64_t t = begin; t < end; ++t) {
+        const int64_t b = t / block_size;
+        const int64_t s = t - b * block_size;
+        const uint8_t* block_base = fp8_storage + b * storage_block_stride_bytes;
+        const uint8_t* nope_rope = block_base + s * nope_rope_per_token;
+        const uint8_t* scale_base = block_base + block_size * nope_rope_per_token + s * scale_stride;
+        at::BFloat16* dst = out + t * meta.d;
+
+        const at::BFloat16* rope_ptr = reinterpret_cast<const at::BFloat16*>(nope_rope + meta.d_nope);
+
+        for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
+          const float sc = fp8_e8m0_to_float(scale_base[tile]);
+          for (int64_t i = 0; i < meta.tile_size; ++i) {
+            const int64_t k = tile * meta.tile_size + i;
+            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(nope_rope[k]) * sc);
+          }
+        }
+        for (int64_t k = 0; k < meta.d_rope; ++k) {
+          dst[meta.d_nope + k] = rope_ptr[k];
+        }
+      }
+    });
+  }
+}
+
+at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout, int64_t active_total_tokens) {
+  const FP8LayoutMeta meta = get_fp8_meta(layout);
+
+  TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, packed_bytes]");
+  TORCH_CHECK(k_cache.size(2) == 1, "h_k must be 1 for FlashMLA sparse FP8 path");
+  TORCH_CHECK(
+      k_cache.dtype() == at::kFloat8_e4m3fn,
+      "flash_mla_with_kvcache_cpu: expect FP8 k_cache to be float8_e4m3fn, got ",
+      k_cache.dtype());
+
+  const int64_t num_blocks = k_cache.size(0);
+  const int64_t block_size = k_cache.size(1);
+  const int64_t capacity = num_blocks * block_size;
+  TORCH_CHECK(
+      active_total_tokens >= 0 && active_total_tokens <= capacity,
+      "flash_mla_with_kvcache_cpu: active_total_tokens (",
+      active_total_tokens,
+      ") must be within KV-cache capacity (",
+      capacity,
+      ")");
+
+  const int64_t storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
+  auto out = at::empty({active_total_tokens, meta.d}, k_cache.options().dtype(at::kBFloat16));
+  const uint8_t* fp8_storage = static_cast<const uint8_t*>(k_cache.data_ptr());
+
+  if (layout == kV32FP8Sparse) {
+    dequantize_fp8_kvcache_impl<kV32FP8Sparse>(
+        out.data_ptr<at::BFloat16>(),
+        fp8_storage,
+        block_size,
+        active_total_tokens,
+        storage_block_stride_bytes);
+  } else {
+    dequantize_fp8_kvcache_impl<kModel1FP8Sparse>(
+        out.data_ptr<at::BFloat16>(),
+        fp8_storage,
+        block_size,
+        active_total_tokens,
+        storage_block_stride_bytes);
+  }
+  return out;
+}
+
 template <typename index_t>
 int64_t infer_active_total_tokens(
     const index_t* __restrict__ indices,
@@ -225,6 +338,19 @@ inline int64_t choose_sparse_decode_block_n(int64_t effective_topk_limit) {
     return 64;
   }
   return 128;
+}
+
+inline bool should_predequantize_fp8_kvcache(
+    int64_t active_total_tokens,
+    int64_t effective_topk_limit,
+    int64_t batches,
+    int64_t s_q,
+    int64_t num_h_blocks) {
+  if (active_total_tokens <= 0 || effective_topk_limit <= 0) {
+    return false;
+  }
+  const int64_t ondemand_rows = batches * s_q * num_h_blocks * effective_topk_limit;
+  return active_total_tokens <= ondemand_rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1107,16 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     }
   }
 
+  constexpr int64_t kBLOCK_H_MAX = 16;
+  const int64_t block_h = (B * S_q) >= 16 ? kBLOCK_H_MAX : 8;
+  const int64_t num_h_blocks = div_up(H_q, block_h);
+  const int64_t effective_topk_main = infer_effective_topk_limit(topk_main, B, tl_main_ptr);
+  const int64_t effective_topk_extra = infer_effective_topk_limit(topk_extra, B, tl_extra_ptr);
+  const int64_t selected_block_n =
+      choose_sparse_decode_block_n(std::max(effective_topk_main, effective_topk_extra));
+
+  at::Tensor k_dequant_main;
+  at::Tensor k_dequant_extra;
   const at::BFloat16* k_main_ptr = nullptr;
   const at::BFloat16* k_extra_ptr = nullptr;
   const uint8_t* fp8_main_ptr = nullptr;
@@ -1010,9 +1146,16 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         ? meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2
         : meta.d_nope + meta.num_tiles + 1 + meta.d_rope * 2;
     CHECK_EQ(k_cache.size(3), fp8_bytes_per_token);
-    fp8_main_ptr = static_cast<const uint8_t*>(k_cache.data_ptr());
-    fp8_main_block_size = k_cache.size(1);
-    fp8_main_storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
+    if (should_predequantize_fp8_kvcache(
+            total_tokens_main, effective_topk_main, B, S_q, num_h_blocks)) {
+      k_dequant_main = dequantize_fp8_kvcache(k_cache, fp8_layout, total_tokens_main);
+      k_main_ptr = k_dequant_main.data_ptr<at::BFloat16>();
+      k_main_strideN = k_dequant_main.stride(0);
+    } else {
+      fp8_main_ptr = static_cast<const uint8_t*>(k_cache.data_ptr());
+      fp8_main_block_size = k_cache.size(1);
+      fp8_main_storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
+    }
 
     if (has_extra) {
       const at::Tensor& extra = extra_k_cache.value();
@@ -1022,9 +1165,16 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
           extra.dtype());
       CHECK_EQ(extra.size(2), 1);
       CHECK_EQ(extra.size(3), fp8_bytes_per_token);
-      fp8_extra_ptr = static_cast<const uint8_t*>(extra.data_ptr());
-      fp8_extra_block_size = extra.size(1);
-      fp8_extra_storage_block_stride_bytes = extra.stride(0) * extra.element_size();
+      if (should_predequantize_fp8_kvcache(
+              total_tokens_extra, effective_topk_extra, B, S_q, num_h_blocks)) {
+        k_dequant_extra = dequantize_fp8_kvcache(extra, fp8_layout, total_tokens_extra);
+        k_extra_ptr = k_dequant_extra.data_ptr<at::BFloat16>();
+        k_extra_strideN = k_dequant_extra.stride(0);
+      } else {
+        fp8_extra_ptr = static_cast<const uint8_t*>(extra.data_ptr());
+        fp8_extra_block_size = extra.size(1);
+        fp8_extra_storage_block_stride_bytes = extra.stride(0) * extra.element_size();
+      }
     }
   } else {
     TORCH_CHECK(
@@ -1056,17 +1206,10 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
 
   // 3) per-thread B buffer for K (head_size) + V (head_size_v) packing,
   //    plus an f32 V accumulator of size kBLOCK_H_MAX * head_size_v.
-  // Packed K/V tiles are independent of the head block, so cross-head-block
-  // reuse would require hoisting the N-tile loop outside the head-block loop
-  // and keeping per-head-block online-softmax state.  That trades repeated
-  // pack/dequant work for much larger per-thread accumulators and less
-  // head-block parallelism; keep the current parallel schedule and use dynamic
-  // BLOCK_N to reduce work on short effective top-k instead.
-  const int64_t effective_topk_main = infer_effective_topk_limit(topk_main, B, tl_main_ptr);
-  const int64_t effective_topk_extra = infer_effective_topk_limit(topk_extra, B, tl_extra_ptr);
-  const int64_t selected_block_n =
-      choose_sparse_decode_block_n(std::max(effective_topk_main, effective_topk_extra));
-  constexpr int64_t kBLOCK_H_MAX = 16;
+  // Reuse dense-prefix FP8 dequantization for cases where on-demand dequant
+  // would repeat the same sparse rows across multiple head blocks; keep
+  // on-demand only for sparse high-index cases where it avoids large unused
+  // active-prefix materialization.
   TORCH_CHECK(D_qk % 32 == 0, "head_dim_qk must be a multiple of 32");
   TORCH_CHECK(D_v % 32 == 0, "head_dim_v must be a multiple of 32");
 
