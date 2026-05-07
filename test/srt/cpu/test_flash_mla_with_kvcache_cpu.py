@@ -175,6 +175,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         is_fp8_kvcache=True,
         topk_length_value=None,
         extra_topk_length_value=None,
+        high_sparse_indices=False,
     ):
         d_qk, d_v = _LAYOUT_DIMS[fp8_layout]
         layout_enum = flashmla_quant.FP8KVCacheLayout(fp8_layout)
@@ -193,6 +194,13 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         indices = self._make_indices(
             b, s_q, topk, total_tokens, dtype=idx_dtype, invalid_ratio=invalid_ratio
         )
+        if high_sparse_indices:
+            pool = torch.tensor(
+                list(range(min(8, total_tokens))) + [total_tokens - 1],
+                dtype=idx_dtype,
+            )
+            pick = torch.randint(0, pool.numel(), (b, s_q, topk))
+            indices = pool[pick]
 
         attn_sink = (
             torch.randn(h_q, dtype=torch.float32) if have_attn_sink else None
@@ -228,6 +236,13 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
             extra_indices = self._make_indices(
                 b, s_q, extra_topk, extra_total_tokens, dtype=idx_dtype
             )
+            if high_sparse_indices:
+                pool = torch.tensor(
+                    list(range(min(8, extra_total_tokens))) + [extra_total_tokens - 1],
+                    dtype=idx_dtype,
+                )
+                pick = torch.randint(0, pool.numel(), (b, s_q, extra_topk))
+                extra_indices = pool[pick]
             if have_extra_topk_length:
                 if extra_topk_length_value is None:
                     lo = max(1, extra_topk // 2)
@@ -399,6 +414,27 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     have_extra_topk_length=True,
                     extra_topk_length_value=9,
                     is_fp8_kvcache=is_fp8_kvcache,
+                )
+
+    def test_fp8_sparse_high_index_on_demand_dequant(self):
+        # Indices touch only a small sparse set plus a high token near capacity,
+        # covering the on-demand FP8 dequant path without relying on dense
+        # active-prefix BF16 dequantization.
+        for fp8_layout in (1, 2):
+            with self.subTest(fp8_layout=fp8_layout):
+                self._run_one(
+                    b=2,
+                    s_q=1,
+                    h_q=16,
+                    topk=64,
+                    page_size=128,
+                    num_blocks=8,
+                    fp8_layout=fp8_layout,
+                    have_extra=True,
+                    extra_topk=32,
+                    extra_num_blocks=4,
+                    is_fp8_kvcache=True,
+                    high_sparse_indices=True,
                 )
 
     def test_with_invalid_indices(self):

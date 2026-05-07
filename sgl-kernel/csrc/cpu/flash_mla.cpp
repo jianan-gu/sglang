@@ -49,10 +49,8 @@ namespace {
 //     [block_size * 8 bytes                    ; 7 e8m0 scales per token + 1 byte pad]
 //   block stride is padded up to a multiple of 576 bytes.
 //
-// We dequantize once into a [num_blocks*block_size, d_qk] BF16 buffer and
-// reuse it for both the Q@K (head_size = d_qk) and the S@V (head_size_v
-// columns of the same buffer).  Memory footprint for typical decode shapes
-// (~few MB) is small relative to the QK^T and softmax compute.
+// FP8 sparse decode dequantizes indexed rows on demand while packing AMX
+// tiles, avoiding an active-prefix BF16 KV buffer when indices are sparse.
 
 enum FP8KVCacheLayout : int64_t {
   kV32FP8Sparse = 1,    // FP8KVCacheLayout.V32_FP8Sparse
@@ -101,134 +99,58 @@ inline float fp8_e8m0_to_float(uint8_t v) {
   return u.f;
 }
 
-// Dequantize the active FP8 KV-cache prefix into a contiguous BF16 tensor of
-// shape [active_total_tokens, d_qk].  This is parallel over tokens.
-//
-// `fp8_storage` is the raw byte view of `k_cache` (last dim = bytes_per_token
-// for V32 / variable padded for MODEL1).
 template <int64_t LAYOUT>
-void dequantize_fp8_kvcache_impl(
-    at::BFloat16* __restrict__ out,
+inline at::BFloat16 dequantize_fp8_kvcache_value(
     const uint8_t* __restrict__ fp8_storage,
     int64_t block_size,
-    int64_t active_total_tokens,
-    int64_t storage_block_stride_bytes) {
+    int64_t storage_block_stride_bytes,
+    int64_t token_idx,
+    int64_t dim) {
   static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
   constexpr FP8LayoutMeta meta = (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4}
                                                             : FP8LayoutMeta{512, 448, 64, 64, 7};
 
-  const int64_t total_tokens = active_total_tokens;
+  const int64_t b = token_idx / block_size;
+  const int64_t s = token_idx - b * block_size;
 
   if constexpr (LAYOUT == kV32FP8Sparse) {
-    constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;  // 656
-
-    at::parallel_for(0, total_tokens, /*grain_size*/ 16, [&](int64_t begin, int64_t end) {
-      for (int64_t t = begin; t < end; ++t) {
-        const int64_t b = t / block_size;
-        const int64_t s = t - b * block_size;
-        const uint8_t* src = fp8_storage + b * storage_block_stride_bytes + s * bytes_per_token;
-        at::BFloat16* dst = out + t * meta.d;
-
-        const uint8_t* nope_ptr = src;
-        const float* scale_ptr = reinterpret_cast<const float*>(src + meta.d_nope);
-        const at::BFloat16* rope_ptr =
-            reinterpret_cast<const at::BFloat16*>(src + meta.d_nope + meta.num_tiles * 4);
-
-        for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
-          const float sc = scale_ptr[tile];
-          for (int64_t i = 0; i < meta.tile_size; ++i) {
-            const int64_t k = tile * meta.tile_size + i;
-            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(nope_ptr[k]) * sc);
-          }
-        }
-        // copy bf16 RoPE part as-is
-        for (int64_t k = 0; k < meta.d_rope; ++k) {
-          dst[meta.d_nope + k] = rope_ptr[k];
-        }
-      }
-    });
+    constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;
+    const uint8_t* src = fp8_storage + b * storage_block_stride_bytes + s * bytes_per_token;
+    if (dim < meta.d_nope) {
+      const float* scale_ptr = reinterpret_cast<const float*>(src + meta.d_nope);
+      return static_cast<at::BFloat16>(
+          fp8_e4m3_to_float(src[dim]) * scale_ptr[dim / meta.tile_size]);
+    }
+    const at::BFloat16* rope_ptr =
+        reinterpret_cast<const at::BFloat16*>(src + meta.d_nope + meta.num_tiles * 4);
+    return rope_ptr[dim - meta.d_nope];
   } else {
-    // MODEL1_FP8Sparse: per block layout is
-    //   nope_rope_part : block_size * (d_nope + 2*d_rope) bytes, indexed by token
-    //   scale_part     : block_size * 8 bytes, where last byte per token is padding
-    constexpr int64_t nope_rope_per_token = meta.d_nope + 2 * meta.d_rope;  // 448 + 128 = 576
+    constexpr int64_t nope_rope_per_token = meta.d_nope + 2 * meta.d_rope;
     constexpr int64_t scale_stride = 8;
-
-    at::parallel_for(0, total_tokens, /*grain_size*/ 16, [&](int64_t begin, int64_t end) {
-      for (int64_t t = begin; t < end; ++t) {
-        const int64_t b = t / block_size;
-        const int64_t s = t - b * block_size;
-        const uint8_t* block_base = fp8_storage + b * storage_block_stride_bytes;
-        const uint8_t* nope_rope = block_base + s * nope_rope_per_token;
-        const uint8_t* scale_base =
-            block_base + block_size * nope_rope_per_token + s * scale_stride;
-        at::BFloat16* dst = out + t * meta.d;
-
-        const uint8_t* nope_ptr = nope_rope;
-        const at::BFloat16* rope_ptr =
-            reinterpret_cast<const at::BFloat16*>(nope_rope + meta.d_nope);
-
-        for (int64_t tile = 0; tile < meta.num_tiles; ++tile) {
-          const float sc = fp8_e8m0_to_float(scale_base[tile]);
-          for (int64_t i = 0; i < meta.tile_size; ++i) {
-            const int64_t k = tile * meta.tile_size + i;
-            dst[k] = static_cast<at::BFloat16>(fp8_e4m3_to_float(nope_ptr[k]) * sc);
-          }
-        }
-        for (int64_t k = 0; k < meta.d_rope; ++k) {
-          dst[meta.d_nope + k] = rope_ptr[k];
-        }
-      }
-    });
+    const uint8_t* block_base = fp8_storage + b * storage_block_stride_bytes;
+    const uint8_t* nope_rope = block_base + s * nope_rope_per_token;
+    if (dim < meta.d_nope) {
+      const uint8_t* scale_base = block_base + block_size * nope_rope_per_token + s * scale_stride;
+      return static_cast<at::BFloat16>(
+          fp8_e4m3_to_float(nope_rope[dim]) * fp8_e8m0_to_float(scale_base[dim / meta.tile_size]));
+    }
+    const at::BFloat16* rope_ptr = reinterpret_cast<const at::BFloat16*>(nope_rope + meta.d_nope);
+    return rope_ptr[dim - meta.d_nope];
   }
 }
 
-at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout, int64_t active_total_tokens) {
-  const FP8LayoutMeta meta = get_fp8_meta(layout);
-
-  TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, packed_bytes]");
-  TORCH_CHECK(k_cache.size(2) == 1, "h_k must be 1 for FlashMLA sparse FP8 path");
-  TORCH_CHECK(
-      k_cache.dtype() == at::kFloat8_e4m3fn,
-      "flash_mla_with_kvcache_cpu: expect FP8 k_cache to be float8_e4m3fn, got ",
-      k_cache.dtype());
-
-  const int64_t num_blocks = k_cache.size(0);
-  const int64_t block_size = k_cache.size(1);
-  const int64_t capacity = num_blocks * block_size;
-  TORCH_CHECK(
-      active_total_tokens >= 0 && active_total_tokens <= capacity,
-      "flash_mla_with_kvcache_cpu: active_total_tokens (",
-      active_total_tokens,
-      ") must be within KV-cache capacity (",
-      capacity,
-      ")");
-
-  // Each block is contiguous in storage but its trailing-bytes count differs
-  // per layout.  The outermost stride in *bytes* tells us the true padded
-  // block stride (= 576-byte aligned for MODEL1).
-  const int64_t block_stride_elems = k_cache.stride(0);
-  const int64_t storage_block_stride_bytes = block_stride_elems * k_cache.element_size();
-
-  auto out = at::empty({active_total_tokens, meta.d}, k_cache.options().dtype(at::kBFloat16));
-  const uint8_t* fp8_storage = static_cast<const uint8_t*>(k_cache.data_ptr());
-
-  if (layout == kV32FP8Sparse) {
-    dequantize_fp8_kvcache_impl<kV32FP8Sparse>(
-        out.data_ptr<at::BFloat16>(),
-        fp8_storage,
-        block_size,
-        active_total_tokens,
-        storage_block_stride_bytes);
-  } else {
-    dequantize_fp8_kvcache_impl<kModel1FP8Sparse>(
-        out.data_ptr<at::BFloat16>(),
-        fp8_storage,
-        block_size,
-        active_total_tokens,
-        storage_block_stride_bytes);
+template <int64_t LAYOUT>
+inline void dequantize_fp8_kvcache_32(
+    at::BFloat16* __restrict__ out,
+    const uint8_t* __restrict__ fp8_storage,
+    int64_t block_size,
+    int64_t storage_block_stride_bytes,
+    int64_t token_idx,
+    int64_t dim_start) {
+  for (int64_t i = 0; i < 32; ++i) {
+    out[i] = dequantize_fp8_kvcache_value<LAYOUT>(
+        fp8_storage, block_size, storage_block_stride_bytes, token_idx, dim_start + i);
   }
-  return out;
 }
 
 template <typename index_t>
@@ -398,6 +320,140 @@ void sparse_pack_vnni(
 #endif
 }
 
+#if defined(CPU_CAPABILITY_AVX512)
+template <int64_t LAYOUT, typename scalar_t, typename index_t>
+inline void sparse_pack_fp8_vnni_Nx32(
+    scalar_t* __restrict__ dst0,
+    scalar_t* __restrict__ dst1,
+    const uint8_t* __restrict__ fp8_storage,
+    const index_t* __restrict__ ind,
+    const bool* __restrict__ valid_mask,
+    int N,
+    int64_t dim_start,
+    int64_t block_size,
+    int64_t storage_block_stride_bytes,
+    int ld_dst0,
+    int ld_dst1,
+    bool convert_v) {
+  __m512i vinputs[16];
+  alignas(64) at::BFloat16 rows[16][32];
+  int n = 0;
+  for (; n < N; ++n) {
+    if (!valid_mask[n]) {
+      vinputs[n] = _mm512_set1_epi32(0);
+    } else {
+      dequantize_fp8_kvcache_32<LAYOUT>(
+          rows[n],
+          fp8_storage,
+          block_size,
+          storage_block_stride_bytes,
+          static_cast<int64_t>(ind[n]),
+          dim_start);
+      vinputs[n] = _mm512_loadu_si512(rows[n]);
+    }
+  }
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  if (convert_v) {
+    for (int nn = 0; nn < 16; nn += 2) {
+      __m512i d0, d1;
+      std::tie(d0, d1) = transpose_2x32_16bit(vinputs[nn], vinputs[nn + 1]);
+      _mm512_storeu_si512(dst1 + (nn >> 1) * ld_dst1 * 2, d0);
+      _mm512_storeu_si512(dst1 + (nn >> 1) * ld_dst1 * 2 + 32, d1);
+    }
+  }
+
+  transpose_16x16_32bit(vinputs);
+  const __mmask16 vmask = (1 << N) - 1;
+  for (int k = 0; k < 16; ++k) {
+    _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
+  }
+}
+#endif
+
+template <int64_t LAYOUT, typename scalar_t, typename index_t>
+void sparse_pack_fp8_vnni(
+    scalar_t* __restrict__ dst0,
+    scalar_t* __restrict__ dst1,
+    const uint8_t* __restrict__ fp8_storage,
+    const index_t* __restrict__ ind,
+    const bool* __restrict__ valid_mask,
+    int N,
+    int K,
+    int Kv,
+    int64_t block_size,
+    int64_t storage_block_stride_bytes,
+    int ld_dst0,
+    int ld_dst1) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const int NB = div_up(N, 16);
+  const int KB = K / 32;
+  const int KBv = Kv / 32;
+  for (int nb = 0; nb < NB; ++nb) {
+    for (int kb = 0; kb < KB; ++kb) {
+      int nb_size = std::min(N - nb * 16, 16);
+      sparse_pack_fp8_vnni_Nx32<LAYOUT, scalar_t, index_t>(
+          /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
+          /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
+          /*     src */ fp8_storage,
+          /*     ind */ ind + nb * 16,
+          /*   valid */ valid_mask + nb * 16,
+          /*       N */ nb_size,
+          /* dim_str */ kb * 32,
+          /* blk_sz  */ block_size,
+          /* blk_str */ storage_block_stride_bytes,
+          /* ld_dst0 */ ld_dst0,
+          /* ld_dst1 */ ld_dst1,
+          /*   cvt_v */ kb < KBv);
+    }
+  }
+#else
+  // Reference scalar fallback (NO-AVX512 build).
+  for (int n = 0; n < N; ++n) {
+    const bool valid = valid_mask[n];
+    const int64_t idx = static_cast<int64_t>(ind[n]);
+    for (int k = 0; k < K / 2; ++k) {
+      for (int d = 0; d < 2; ++d) {
+        scalar_t v = !valid ? scalar_t(0)
+                            : dequantize_fp8_kvcache_value<LAYOUT>(
+                                  fp8_storage,
+                                  block_size,
+                                  storage_block_stride_bytes,
+                                  idx,
+                                  k * 2 + d);
+        dst0[k * ld_dst0 * 2 + n * 2 + d] = v;
+      }
+    }
+  }
+  for (int n = 0; n < (N >> 1) * 2; n += 2) {
+    const int64_t i0 = static_cast<int64_t>(ind[n + 0]);
+    const int64_t i1 = static_cast<int64_t>(ind[n + 1]);
+    const bool valid0 = valid_mask[n + 0];
+    const bool valid1 = valid_mask[n + 1];
+    for (int k = 0; k < Kv; ++k) {
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = !valid0
+          ? scalar_t(0)
+          : dequantize_fp8_kvcache_value<LAYOUT>(fp8_storage, block_size, storage_block_stride_bytes, i0, k);
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = !valid1
+          ? scalar_t(0)
+          : dequantize_fp8_kvcache_value<LAYOUT>(fp8_storage, block_size, storage_block_stride_bytes, i1, k);
+    }
+  }
+  if (N % 2 != 0) {
+    const int64_t idx = static_cast<int64_t>(ind[N - 1]);
+    const bool valid = valid_mask[N - 1];
+    for (int k = 0; k < Kv; ++k) {
+      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = !valid
+          ? scalar_t(0)
+          : dequantize_fp8_kvcache_value<LAYOUT>(fp8_storage, block_size, storage_block_stride_bytes, idx, k);
+      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
+    }
+  }
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Helpers shared with decode.cpp (small inline duplicates so we don't have to
 // expose them through a header).
@@ -460,7 +516,8 @@ inline void fmla_finalize_out(
 // Main kernel: sparse MLA decode (AMX BF16 brgemm).
 //
 // query    : [B, S_q, H_q, D_qk]   bf16
-// k_main   : [active_main_tokens, D_qk] bf16 or original bf16 cache flattened
+// k_main   : original bf16 cache flattened, or null when using FP8 cache
+// fp8_main : original FP8 cache storage, or null when using bf16 cache
 // indices  : [B, S_q, topk_main]        int32/int64
 // k_extra  : optional extra KV source with its own indices
 // topk_len : [B]                   int32 or null
@@ -476,6 +533,8 @@ void sparse_mla_decode_kernel_impl(
     const scalar_t* __restrict__ query,
     const scalar_t* __restrict__ k_main,
     const scalar_t* __restrict__ k_extra,
+    const uint8_t* __restrict__ fp8_main,
+    const uint8_t* __restrict__ fp8_extra,
     const index_t* __restrict__ indices,
     const index_t* __restrict__ extra_indices,
     const int32_t* __restrict__ topk_length,
@@ -491,6 +550,11 @@ void sparse_mla_decode_kernel_impl(
     int64_t topk_extra,
     int64_t total_tokens_main,
     int64_t total_tokens_extra,
+    int64_t fp8_layout,
+    int64_t fp8_main_block_size,
+    int64_t fp8_extra_block_size,
+    int64_t fp8_main_storage_block_stride_bytes,
+    int64_t fp8_extra_storage_block_stride_bytes,
     int64_t q_strideB,
     int64_t q_strideS,
     int64_t q_strideH,
@@ -547,12 +611,15 @@ void sparse_mla_decode_kernel_impl(
       }
 
       auto process_cache = [&](const scalar_t* __restrict__ k_ptr,
+                               const uint8_t* __restrict__ fp8_ptr,
                                const index_t* __restrict__ cur_idx_ptr,
                                const int32_t* __restrict__ cur_topk_length,
                                int64_t topk_count,
                                int64_t total_tokens,
+                               int64_t fp8_block_size,
+                               int64_t fp8_storage_block_stride_bytes,
                                int64_t k_strideN) {
-        if (k_ptr == nullptr || cur_idx_ptr == nullptr || topk_count == 0) {
+        if ((k_ptr == nullptr && fp8_ptr == nullptr) || cur_idx_ptr == nullptr || topk_count == 0) {
           return;
         }
         const int64_t topk_limit = cur_topk_length != nullptr
@@ -581,18 +648,50 @@ void sparse_mla_decode_kernel_impl(
 
           // Pack K (BLOCK_N rows via gather) into Btmp0 (key, vnni) and Btmp1
           // (value, vnni). Invalid entries load zeros and are masked below.
-          sparse_pack_vnni<scalar_t, index_t>(
-              /*    dst0 */ Btmp0,
-              /*    dst1 */ Btmp1,
-              /*     src */ k_ptr,
-              /*     ind */ cur_idx_ptr + n,
-              /*   valid */ valid_mask,
-              /*       N */ static_cast<int>(n_size),
-              /*       K */ static_cast<int>(head_size),
-              /*      Kv */ static_cast<int>(head_size_v),
-              /*  ld_src */ static_cast<int>(k_strideN),
-              /* ld_dst0 */ static_cast<int>(BLOCK_N),
-              /* ld_dst1 */ static_cast<int>(head_size_v));
+          if (fp8_ptr != nullptr) {
+            if (fp8_layout == kV32FP8Sparse) {
+              sparse_pack_fp8_vnni<kV32FP8Sparse, scalar_t, index_t>(
+                  /*    dst0 */ Btmp0,
+                  /*    dst1 */ Btmp1,
+                  /*     src */ fp8_ptr,
+                  /*     ind */ cur_idx_ptr + n,
+                  /*   valid */ valid_mask,
+                  /*       N */ static_cast<int>(n_size),
+                  /*       K */ static_cast<int>(head_size),
+                  /*      Kv */ static_cast<int>(head_size_v),
+                  /* blk_sz  */ fp8_block_size,
+                  /* blk_str */ fp8_storage_block_stride_bytes,
+                  /* ld_dst0 */ static_cast<int>(BLOCK_N),
+                  /* ld_dst1 */ static_cast<int>(head_size_v));
+            } else {
+              sparse_pack_fp8_vnni<kModel1FP8Sparse, scalar_t, index_t>(
+                  /*    dst0 */ Btmp0,
+                  /*    dst1 */ Btmp1,
+                  /*     src */ fp8_ptr,
+                  /*     ind */ cur_idx_ptr + n,
+                  /*   valid */ valid_mask,
+                  /*       N */ static_cast<int>(n_size),
+                  /*       K */ static_cast<int>(head_size),
+                  /*      Kv */ static_cast<int>(head_size_v),
+                  /* blk_sz  */ fp8_block_size,
+                  /* blk_str */ fp8_storage_block_stride_bytes,
+                  /* ld_dst0 */ static_cast<int>(BLOCK_N),
+                  /* ld_dst1 */ static_cast<int>(head_size_v));
+            }
+          } else {
+            sparse_pack_vnni<scalar_t, index_t>(
+                /*    dst0 */ Btmp0,
+                /*    dst1 */ Btmp1,
+                /*     src */ k_ptr,
+                /*     ind */ cur_idx_ptr + n,
+                /*   valid */ valid_mask,
+                /*       N */ static_cast<int>(n_size),
+                /*       K */ static_cast<int>(head_size),
+                /*      Kv */ static_cast<int>(head_size_v),
+                /*  ld_src */ static_cast<int>(k_strideN),
+                /* ld_dst0 */ static_cast<int>(BLOCK_N),
+                /* ld_dst1 */ static_cast<int>(head_size_v));
+          }
 
           // Q @ K
           at::native::cpublas::brgemm(
@@ -673,13 +772,25 @@ void sparse_mla_decode_kernel_impl(
         }
       };
 
-      process_cache(k_main, idx_ptr, topk_length, topk_main, total_tokens_main, k_main_strideN);
+      process_cache(
+          k_main,
+          fp8_main,
+          idx_ptr,
+          topk_length,
+          topk_main,
+          total_tokens_main,
+          fp8_main_block_size,
+          fp8_main_storage_block_stride_bytes,
+          k_main_strideN);
       process_cache(
           k_extra,
+          fp8_extra,
           extra_idx_ptr,
           extra_topk_length,
           topk_extra,
           total_tokens_extra,
+          fp8_extra_block_size,
+          fp8_extra_storage_block_stride_bytes,
           k_extra_strideN);
 
       // Apply attention sink correction directly on the output and lse.
@@ -842,35 +953,50 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     }
   }
 
-  at::Tensor k_dequant_main;
-  at::Tensor k_dequant_extra;
   const at::BFloat16* k_main_ptr = nullptr;
   const at::BFloat16* k_extra_ptr = nullptr;
+  const uint8_t* fp8_main_ptr = nullptr;
+  const uint8_t* fp8_extra_ptr = nullptr;
   int64_t k_main_strideN = D_qk;
   int64_t k_extra_strideN = D_qk;
+  int64_t fp8_main_block_size = 0;
+  int64_t fp8_extra_block_size = 0;
+  int64_t fp8_main_storage_block_stride_bytes = 0;
+  int64_t fp8_extra_storage_block_stride_bytes = 0;
 
   if (is_fp8_kvcache) {
-    k_dequant_main = dequantize_fp8_kvcache(k_cache, fp8_layout, total_tokens_main);
+    const FP8LayoutMeta meta = get_fp8_meta(fp8_layout);
     TORCH_CHECK(
-        k_dequant_main.size(1) == D_qk,
-        "k_cache dequantized D_qk (",
-        k_dequant_main.size(1),
+        meta.d == D_qk,
+        "k_cache FP8 layout D_qk (",
+        meta.d,
         ") does not match q's last dim (",
         D_qk,
         ")");
-    k_main_ptr = k_dequant_main.data_ptr<at::BFloat16>();
-    k_main_strideN = k_dequant_main.stride(0);
+    TORCH_CHECK(k_cache.size(2) == 1, "h_k must be 1 for FlashMLA sparse FP8 path");
+    TORCH_CHECK(
+        k_cache.dtype() == at::kFloat8_e4m3fn,
+        "flash_mla_with_kvcache_cpu: expect FP8 k_cache to be float8_e4m3fn, got ",
+        k_cache.dtype());
+    const int64_t fp8_bytes_per_token = fp8_layout == kV32FP8Sparse
+        ? meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2
+        : meta.d_nope + meta.num_tiles + 1 + meta.d_rope * 2;
+    CHECK_EQ(k_cache.size(3), fp8_bytes_per_token);
+    fp8_main_ptr = static_cast<const uint8_t*>(k_cache.data_ptr());
+    fp8_main_block_size = k_cache.size(1);
+    fp8_main_storage_block_stride_bytes = k_cache.stride(0) * k_cache.element_size();
+
     if (has_extra) {
-      k_dequant_extra = dequantize_fp8_kvcache(extra_k_cache.value(), fp8_layout, total_tokens_extra);
+      const at::Tensor& extra = extra_k_cache.value();
       TORCH_CHECK(
-          k_dequant_extra.size(1) == D_qk,
-          "extra_k_cache dequantized D_qk (",
-          k_dequant_extra.size(1),
-          ") does not match q's last dim (",
-          D_qk,
-          ")");
-      k_extra_ptr = k_dequant_extra.data_ptr<at::BFloat16>();
-      k_extra_strideN = k_dequant_extra.stride(0);
+          extra.dtype() == at::kFloat8_e4m3fn,
+          "flash_mla_with_kvcache_cpu: expect FP8 extra_k_cache to be float8_e4m3fn, got ",
+          extra.dtype());
+      CHECK_EQ(extra.size(2), 1);
+      CHECK_EQ(extra.size(3), fp8_bytes_per_token);
+      fp8_extra_ptr = static_cast<const uint8_t*>(extra.data_ptr());
+      fp8_extra_block_size = extra.size(1);
+      fp8_extra_storage_block_stride_bytes = extra.stride(0) * extra.element_size();
     }
   } else {
     TORCH_CHECK(
@@ -931,6 +1057,8 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         q.data_ptr<at::BFloat16>(),
         k_main_ptr,
         k_extra_ptr,
+        fp8_main_ptr,
+        fp8_extra_ptr,
         indices.data_ptr<int32_t>(),
         has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
         tl_main_ptr,
@@ -946,6 +1074,11 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         topk_extra,
         total_tokens_main,
         total_tokens_extra,
+        is_fp8_kvcache ? fp8_layout : 0,
+        fp8_main_block_size,
+        fp8_extra_block_size,
+        fp8_main_storage_block_stride_bytes,
+        fp8_extra_storage_block_stride_bytes,
         q_strideB,
         q_strideS,
         q_strideH,
@@ -964,6 +1097,8 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         q.data_ptr<at::BFloat16>(),
         k_main_ptr,
         k_extra_ptr,
+        fp8_main_ptr,
+        fp8_extra_ptr,
         indices.data_ptr<int64_t>(),
         has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
         tl_main_ptr,
@@ -979,6 +1114,11 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         topk_extra,
         total_tokens_main,
         total_tokens_extra,
+        is_fp8_kvcache ? fp8_layout : 0,
+        fp8_main_block_size,
+        fp8_extra_block_size,
+        fp8_main_storage_block_stride_bytes,
+        fp8_extra_storage_block_stride_bytes,
         q_strideB,
         q_strideS,
         q_strideH,
