@@ -398,6 +398,136 @@ void sparse_pack_vnni(
 #endif
 }
 
+template <typename scalar_t, typename index_t>
+void sparse_pack_vnni_value_only(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    const bool* __restrict__ valid_mask,
+    int N,
+    int Kv,
+    int ld_src,
+    int ld_dst) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const int NB = div_up(N, 16);
+  const int KBv = Kv / 32;
+  for (int nb = 0; nb < NB; ++nb) {
+    const int nb_size = std::min(N - nb * 16, 16);
+    for (int kb = 0; kb < KBv; ++kb) {
+      __m512i vinputs[16];
+      int n = 0;
+      for (; n < nb_size; ++n) {
+        const index_t idx = ind[nb * 16 + n];
+        if (!valid_mask[nb * 16 + n]) {
+          vinputs[n] = _mm512_set1_epi32(0);
+        } else {
+          vinputs[n] = _mm512_loadu_si512(src + idx * ld_src + kb * 32);
+        }
+      }
+      for (; n < 16; ++n) {
+        vinputs[n] = _mm512_set1_epi32(0);
+      }
+
+      for (int nn = 0; nn < 16; nn += 2) {
+        __m512i d0, d1;
+        std::tie(d0, d1) = transpose_2x32_16bit(vinputs[nn], vinputs[nn + 1]);
+        _mm512_storeu_si512(dst + ((nb * 16 + nn) >> 1) * ld_dst * 2 + kb * 32 * 2, d0);
+        _mm512_storeu_si512(dst + ((nb * 16 + nn) >> 1) * ld_dst * 2 + kb * 32 * 2 + 32, d1);
+      }
+    }
+  }
+#else
+  for (int n = 0; n < (N >> 1) * 2; n += 2) {
+    index_t i0 = ind[n + 0];
+    index_t i1 = ind[n + 1];
+    const bool valid0 = valid_mask[n + 0];
+    const bool valid1 = valid_mask[n + 1];
+    for (int k = 0; k < Kv; ++k) {
+      dst[(n >> 1) * ld_dst * 2 + k * 2 + 0] = !valid0 ? scalar_t(0) : src[i0 * ld_src + k];
+      dst[(n >> 1) * ld_dst * 2 + k * 2 + 1] = !valid1 ? scalar_t(0) : src[i1 * ld_src + k];
+    }
+  }
+  if (N % 2 != 0) {
+    index_t idx = ind[N - 1];
+    const bool valid = valid_mask[N - 1];
+    for (int k = 0; k < Kv; ++k) {
+      dst[(N >> 1) * ld_dst * 2 + k * 2 + 0] = !valid ? scalar_t(0) : src[idx * ld_src + k];
+      dst[(N >> 1) * ld_dst * 2 + k * 2 + 1] = 0;
+    }
+  }
+#endif
+}
+
+template <typename scalar_t, typename index_t>
+void sparse_qk_gemm_nt(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    const index_t* __restrict__ indices,
+    const bool* __restrict__ valid_mask,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc) {
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
+      if (!valid_mask[n]) {
+        C[m * ldc + n] = 0.f;
+        continue;
+      }
+      const int64_t b_idx = indices[n];
+      float sum = 0.f;
+      for (int64_t k = 0; k < K; ++k) {
+        sum += static_cast<float>(A[m * lda + k]) * static_cast<float>(B[b_idx * ldb + k]);
+      }
+      C[m * ldc + n] = sum;
+    }
+  }
+}
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <typename index_t>
+void sparse_qk_gemm_nt(
+    const at::BFloat16* __restrict__ A,
+    const at::BFloat16* __restrict__ B,
+    float* __restrict__ C,
+    const index_t* __restrict__ indices,
+    const bool* __restrict__ valid_mask,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc) {
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
+      if (!valid_mask[n]) {
+        C[m * ldc + n] = 0.f;
+        continue;
+      }
+
+      const int64_t b_idx = indices[n];
+      __m512 acc = _mm512_setzero_ps();
+      int64_t k = 0;
+      for (; k <= K - 32; k += 32) {
+        __m512bh va = (__m512bh)(_mm512_loadu_si512(A + m * lda + k));
+        __m512bh vb = (__m512bh)(_mm512_loadu_si512(B + b_idx * ldb + k));
+        acc = _mm512_dpbf16_ps(acc, va, vb);
+      }
+      if (k < K) {
+        const __mmask32 mask = (1ULL << (K - k)) - 1;
+        __m512bh va = (__m512bh)(_mm512_maskz_loadu_epi16(mask, A + m * lda + k));
+        __m512bh vb = (__m512bh)(_mm512_maskz_loadu_epi16(mask, B + b_idx * ldb + k));
+        acc = _mm512_dpbf16_ps(acc, va, vb);
+      }
+      C[m * ldc + n] = _mm512_reduce_add_ps(acc);
+    }
+  }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Helpers shared with decode.cpp (small inline duplicates so we don't have to
 // expose them through a header).
@@ -509,10 +639,13 @@ void sparse_mla_decode_kernel_impl(
   const int64_t BLOCK_H = (batches * s_q) >= 16 ? kBLOCK_H_MAX : 8;
   const int64_t num_h_blocks = div_up(num_heads, BLOCK_H);
 
-  // parallel on [B, S_q, head_block]
+  const bool use_tiny_qk = s_q == 1;
+
+  // parallel on [B, head_block, S_q], matching the batch/head/query expansion
+  // used by the existing CPU decode/extend kernels.
   at::parallel_for(0, batches * s_q * num_h_blocks, 0, [&](int64_t begin, int64_t end) {
     int64_t bs{0}, sq{0}, hb{0};
-    data_index_init(begin, bs, batches, sq, s_q, hb, num_h_blocks);
+    data_index_init(begin, bs, batches, hb, num_h_blocks, sq, s_q);
 
     int tid = at::get_thread_num();
     scalar_t* __restrict__ Btmp0 = buffer + tid * buffer_size_per_thread;        // K  packed
@@ -579,33 +712,59 @@ void sparse_mla_decode_kernel_impl(
             continue;
           }
 
-          // Pack K (BLOCK_N rows via gather) into Btmp0 (key, vnni) and Btmp1
-          // (value, vnni). Invalid entries load zeros and are masked below.
-          sparse_pack_vnni<scalar_t, index_t>(
-              /*    dst0 */ Btmp0,
-              /*    dst1 */ Btmp1,
-              /*     src */ k_ptr,
-              /*     ind */ cur_idx_ptr + n,
-              /*   valid */ valid_mask,
-              /*       N */ static_cast<int>(n_size),
-              /*       K */ static_cast<int>(head_size),
-              /*      Kv */ static_cast<int>(head_size_v),
-              /*  ld_src */ static_cast<int>(k_strideN),
-              /* ld_dst0 */ static_cast<int>(BLOCK_N),
-              /* ld_dst1 */ static_cast<int>(head_size_v));
+          if (use_tiny_qk) {
+            // For single-query decode, compute Q @ K directly with AVX512
+            // BF16 dot products and only pack V for the following AMX brgemm.
+            sparse_pack_vnni_value_only<scalar_t, index_t>(
+                /*    dst */ Btmp1,
+                /*    src */ k_ptr,
+                /*    ind */ cur_idx_ptr + n,
+                /*  valid */ valid_mask,
+                /*      N */ static_cast<int>(n_size),
+                /*     Kv */ static_cast<int>(head_size_v),
+                /* ld_src */ static_cast<int>(k_strideN),
+                /* ld_dst */ static_cast<int>(head_size_v));
+            sparse_qk_gemm_nt(
+                /*     A */ q_ptr,
+                /*     B */ k_ptr,
+                /*     C */ s_i,
+                /*   ind */ cur_idx_ptr + n,
+                /* valid */ valid_mask,
+                /*     M */ h_size,
+                /*     N */ n_size,
+                /*     K */ head_size,
+                /*   lda */ q_strideH,
+                /*   ldb */ k_strideN,
+                /*   ldc */ BLOCK_N);
+          } else {
+            // Pack K (BLOCK_N rows via gather) into Btmp0 (key, vnni) and Btmp1
+            // (value, vnni). Invalid entries load zeros and are masked below.
+            sparse_pack_vnni<scalar_t, index_t>(
+                /*    dst0 */ Btmp0,
+                /*    dst1 */ Btmp1,
+                /*     src */ k_ptr,
+                /*     ind */ cur_idx_ptr + n,
+                /*   valid */ valid_mask,
+                /*       N */ static_cast<int>(n_size),
+                /*       K */ static_cast<int>(head_size),
+                /*      Kv */ static_cast<int>(head_size_v),
+                /*  ld_src */ static_cast<int>(k_strideN),
+                /* ld_dst0 */ static_cast<int>(BLOCK_N),
+                /* ld_dst1 */ static_cast<int>(head_size_v));
 
-          // Q @ K
-          at::native::cpublas::brgemm(
-              /* M     */ h_size,
-              /* N     */ n_size,
-              /* K     */ head_size,
-              /* lda   */ q_strideH,
-              /* ldb   */ BLOCK_N,
-              /* ldc   */ BLOCK_N,
-              /* add_C */ false,
-              /* A     */ q_ptr,
-              /* B     */ Btmp0,
-              /* C     */ s_i);
+            // Q @ K
+            at::native::cpublas::brgemm(
+                /* M     */ h_size,
+                /* N     */ n_size,
+                /* K     */ head_size,
+                /* lda   */ q_strideH,
+                /* ldb   */ BLOCK_N,
+                /* ldc   */ BLOCK_N,
+                /* add_C */ false,
+                /* A     */ q_ptr,
+                /* B     */ Btmp0,
+                /* C     */ s_i);
+          }
 
           const Vec scale_vec = Vec(scaling);
           for (int64_t h = 0; h < h_size; ++h) {
@@ -716,7 +875,7 @@ void sparse_mla_decode_kernel_impl(
         lse_out[bs * num_heads * s_q + hh * s_q + sq] = lse_val;
       }
 
-      data_index_step(bs, batches, sq, s_q, hb, num_h_blocks);
+      data_index_step(bs, batches, hb, num_h_blocks, sq, s_q);
     }
     at::native::cpublas::brgemm_release();
   });
