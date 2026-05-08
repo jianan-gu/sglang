@@ -961,8 +961,8 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
 
   if (is_fp8_kvcache) {
     const FP8LayoutMeta meta = get_fp8_meta(fp8_layout);
-    TORCH_CHECK(meta.d == D_qk, "FP8 layout D_qk (", meta.d, ") does not match q's last dim (", D_qk, ")");
-    TORCH_CHECK(meta.d_nope == D_v, "FP8 layout D_v (", meta.d_nope, ") does not match head_dim_v (", D_v, ")");
+    TORCH_CHECK(D_qk <= meta.d, "q's last dim (", D_qk, ") exceeds FP8 layout D_qk capacity (", meta.d, ")");
+    TORCH_CHECK(D_v <= meta.d, "head_dim_v (", D_v, ") exceeds FP8 layout D_v capacity (", meta.d, ")");
     k_main_fp8_info = get_fp8_kvcache_info(k_cache, fp8_layout);
     if (has_extra) {
       k_extra_fp8_info = get_fp8_kvcache_info(extra_k_cache.value(), fp8_layout);
