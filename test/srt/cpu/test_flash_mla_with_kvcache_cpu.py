@@ -1,61 +1,130 @@
-import itertools import unittest
+import itertools
+import unittest
 
-    import torch
+import torch
 
-    from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase
 
-    try :from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu from sglang.srt.flashmla_tests import quant as flashmla_quant
+try:
+    from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
+    from sglang.srt.flashmla_tests import quant as flashmla_quant
 
-    _IMPORT_ERROR = None except Exception as _e: #pragma:no cover - exercised only when kernel missing flash_mla_with_kvcache_cpu = None #type:ignore[assignment] flashmla_quant = None #type:ignore[assignment] _IMPORT_ERROR = _e
+    _IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover - exercised only when kernel missing
+    flash_mla_with_kvcache_cpu = None  # type: ignore[assignment]
+    flashmla_quant = None  # type: ignore[assignment]
+    _IMPORT_ERROR = _e
 
-#Map ``fp8_layout`` integer(matches ``FP8KVCacheLayout`` C++ enum and
-# ``flashmla_quant.FP8KVCacheLayout``)->(d_qk, d_v).
-    _LAYOUT_DIMS = {1 : (576, 512), #V32_FP8Sparse 2 : (512, 512), #MODEL1_FP8Sparse }
 
-                         def _ref_sparse_attn_decode(q:torch.Tensor, #[B, S_q, H_q, D_qk] bf16 k_dequant:torch.Tensor, #[num_blocks, page_size, 1, D_qk] bf16 indices:torch.Tensor, #[B, S_q, topk] int32 / int64 topk_length, attn_sink, extra_k_dequant, extra_indices, extra_topk_length, sm_scale: float, d_v: int, ) : ""
-                                                                                                                                                                                                                                                                                                                            "Pure-PyTorch reference for the sparse FP8 decode kernel.
-                                                                                                                                                                                      Mirrors:func:`sglang.srt.flashmla_tests.ref.ref_sparse_attn_decode` but accepts already - dequantized BF16 K caches and inlines only the parts needed for the decode comparison.""
-                                                                                                                                                                                                                                                                                                                                                                      "
-                                                                                                                                                                                      b, s_q, h_q, d_qk = q.shape
+# Map ``fp8_layout`` integer (matches ``FP8KVCacheLayout`` C++ enum and
+# ``flashmla_quant.FP8KVCacheLayout``) -> (d_qk, d_v).
+_LAYOUT_DIMS = {
+    1: (576, 512),  # V32_FP8Sparse
+    2: (512, 512),  # MODEL1_FP8Sparse
+}
 
-                                                                                                                                                                                                   def _gather(k_dq:torch.Tensor, idxs:torch.Tensor, tl) :topk = idxs.size(- 1) idxs_fixed = torch.clamp_min(idxs, 0).to(torch.int64) flat_k = k_dq.reshape(- 1, d_qk) gathered =(flat_k.index_select(0, idxs_fixed.reshape(- 1)).reshape(b, s_q, topk, d_qk)) invalid = idxs == - 1 if tl is not None:tl_mask = torch.arange(topk, device = invalid.device).view(1, 1, topk).expand(b, s_q, topk) >= tl.view(b, 1, 1) invalid = invalid | tl_mask return gathered, invalid
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              gathered_kv, invalid_mask = _gather(k_dequant, indices, topk_length) if extra_k_dequant is not None:gathered_kv1, invalid_mask1 = _gather(extra_k_dequant, extra_indices, extra_topk_length) gathered_kv = torch.cat([gathered_kv, gathered_kv1], dim = 2) invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim = 2)
+def _ref_sparse_attn_decode(
+    q: torch.Tensor,                            # [B, S_q, H_q, D_qk] bf16
+    k_dequant: torch.Tensor,                    # [num_blocks, page_size, 1, D_qk] bf16
+    indices: torch.Tensor,                      # [B, S_q, topk] int32/int64
+    topk_length,
+    attn_sink,
+    extra_k_dequant,
+    extra_indices,
+    extra_topk_length,
+    sm_scale: float,
+    d_v: int,
+):
+    """Pure-PyTorch reference for the sparse FP8 decode kernel.
+    Mirrors :func:`sglang.srt.flashmla_tests.ref.ref_sparse_attn_decode`
+    but accepts already-dequantized BF16 K caches and inlines only the
+    parts needed for the decode comparison.
+    """
+    b, s_q, h_q, d_qk = q.shape
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     gathered_kv_f = gathered_kv.reshape(b * s_q, - 1, d_qk).float() gathered_kv_f[gathered_kv_f != gathered_kv_f] = 0.0 #NaN->0
+    def _gather(k_dq: torch.Tensor, idxs: torch.Tensor, tl):
+        topk = idxs.size(-1)
+        idxs_fixed = torch.clamp_min(idxs, 0).to(torch.int64)
+        flat_k = k_dq.reshape(-1, d_qk)
+        gathered = (
+            flat_k.index_select(0, idxs_fixed.reshape(-1))
+            .reshape(b, s_q, topk, d_qk)
+        )
+        invalid = idxs == -1
+        if tl is not None:
+            tl_mask = torch.arange(topk, device=invalid.device).view(
+                1, 1, topk
+            ).expand(b, s_q, topk) >= tl.view(b, 1, 1)
+            invalid = invalid | tl_mask
+        return gathered, invalid
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   q_f = q.float().reshape(b * s_q, h_q, d_qk) attn_weight = q_f @gathered_kv_f.transpose(- 1, - 2) #[B * S_q, H_q, T] attn_weight = attn_weight * sm_scale full_invalid = invalid_mask.reshape(b * s_q, 1, - 1).expand(b * s_q, h_q, invalid_mask.size(- 1)) attn_weight = attn_weight.masked_fill(full_invalid, float("-inf"))
+    gathered_kv, invalid_mask = _gather(k_dequant, indices, topk_length)
+    if extra_k_dequant is not None:
+        gathered_kv1, invalid_mask1 = _gather(
+            extra_k_dequant, extra_indices, extra_topk_length
+        )
+        gathered_kv = torch.cat([gathered_kv, gathered_kv1], dim=2)
+        invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim=2)
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      lse = attn_weight.logsumexp(dim = - 1) #[B * S_q, H_q] probs = torch.exp(attn_weight - lse.unsqueeze(- 1)) output = probs @gathered_kv_f[..., :d_v] output = output.view(b, s_q, h_q, d_v) lse = lse.view(b, s_q, h_q)
+    gathered_kv_f = gathered_kv.reshape(b * s_q, -1, d_qk).float()
+    gathered_kv_f[gathered_kv_f != gathered_kv_f] = 0.0  # NaN -> 0
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    if attn_sink is not None:output = output *(1.0 /(1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))).unsqueeze(- 1)
+    q_f = q.float().reshape(b * s_q, h_q, d_qk)
+    attn_weight = q_f @ gathered_kv_f.transpose(-1, -2)  # [B*S_q, H_q, T]
+    attn_weight = attn_weight * sm_scale
+    full_invalid = invalid_mask.reshape(b * s_q, 1, -1).expand(
+        b * s_q, h_q, invalid_mask.size(-1)
+    )
+    attn_weight = attn_weight.masked_fill(full_invalid, float("-inf"))
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         lonely_q_mask = lse == float("-inf") output = output.masked_fill(lonely_q_mask.unsqueeze(- 1).expand(b, s_q, h_q, d_v), 0.0) lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
+    lse = attn_weight.logsumexp(dim=-1)  # [B*S_q, H_q]
+    probs = torch.exp(attn_weight - lse.unsqueeze(-1))
+    output = probs @ gathered_kv_f[..., :d_v]
+    output = output.view(b, s_q, h_q, d_v)
+    lse = lse.view(b, s_q, h_q)
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                return output.to(torch.bfloat16), lse.transpose(1, 2).contiguous()
+    if attn_sink is not None:
+        output = output * (
+            1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
+        ).unsqueeze(-1)
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     @unittest.skipIf(_IMPORT_ERROR is not None, f "flash_mla_with_kvcache_cpu / flashmla_tests.quant unavailable: {_IMPORT_ERROR}", ) class TestFlashMLAWithKVCacheCPU(CustomTestCase) : ""
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          "Tests for ``flash_mla_with_kvcache_cpu`` (sparse FP8 decode, CPU AMX).
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        Only ``torch.bfloat16`` queries are supported by the kernel(see ``sgl - kernel / csrc / cpu / flash_mla.cpp``); ``page_size`` and the FP8
+    lonely_q_mask = lse == float("-inf")
+    output = output.masked_fill(
+        lonely_q_mask.unsqueeze(-1).expand(b, s_q, h_q, d_v), 0.0
+    )
+    lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
+
+    return output.to(torch.bfloat16), lse.transpose(1, 2).contiguous()
+
+
+@unittest.skipIf(
+    _IMPORT_ERROR is not None,
+    f"flash_mla_with_kvcache_cpu / flashmla_tests.quant unavailable: {_IMPORT_ERROR}",
+)
+class TestFlashMLAWithKVCacheCPU(CustomTestCase):
+    """Tests for ``flash_mla_with_kvcache_cpu`` (sparse FP8 decode, CPU AMX).
+    Only ``torch.bfloat16`` queries are supported by the kernel
+    (see ``sgl-kernel/csrc/cpu/flash_mla.cpp``); ``page_size`` and the FP8
     KV-cache layout / index dtype are the dimensions we sweep here.
     """
 
     def setUp(self):
         torch.manual_seed(1234)
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-#Helpers
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     def _make_quantized_kv_cache(self, num_blocks, page_size, d_qk, layout_enum):
-#Generate random BF16 K cache then quantize using the project's
-#reference helper.Shape : [num_blocks, page_size, 1, d_qk] bf16.
+        # Generate random BF16 K cache then quantize using the project's
+        # reference helper.  Shape: [num_blocks, page_size, 1, d_qk] bf16.
         k_bf16 = (
             torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
         )
         k_quant = flashmla_quant.quantize_k_cache(k_bf16, layout_enum)
-#Re - dequantize so the BF16 K used by the reference path matches the
-#one the kernel will see internally; this excludes quantization
-#error from the kernel-vs-ref comparison.
+        # Re-dequantize so the BF16 K used by the reference path matches the
+        # one the kernel will see internally; this excludes quantization
+        # error from the kernel-vs-ref comparison.
         k_dequant = flashmla_quant.dequantize_k_cache(k_quant, layout_enum)
         return k_quant.contiguous(), k_dequant
 
@@ -69,7 +138,7 @@ import itertools import unittest
     def _make_indices(
         self, b, s_q, topk, total_tokens, *, dtype=torch.int32, invalid_ratio=0.0
     ):
-#Unique - per - row valid token indices, optionally with some - 1 entries.
+        # Unique-per-row valid token indices, optionally with some -1 entries.
         idx = torch.empty(b, s_q, topk, dtype=dtype)
         for bi in range(b):
             for si in range(s_q):
@@ -203,28 +272,28 @@ import itertools import unittest
             d_v=d_v,
         )
 
-#Shape / dtype contract.
+        # Shape / dtype contract.
         self.assertEqual(tuple(out_cpu.shape), (b, s_q, h_q, d_v))
         self.assertEqual(tuple(lse_cpu.shape), (b, h_q, s_q))
         self.assertEqual(out_cpu.dtype, torch.bfloat16)
         self.assertEqual(lse_cpu.dtype, torch.float32)
 
-#Numerical check.Tolerances mirror the loosened thresholds used by
-# ``debug_flash_mla_adapter._assert_close``.
+        # Numerical check.  Tolerances mirror the loosened thresholds used by
+        # ``debug_flash_mla_adapter._assert_close``.
         torch.testing.assert_close(out_cpu, out_ref, atol=1e-2, rtol=1e-2)
 
-#LSE : ignore positions that the reference left at + inf
-#(no attendable K) since the kernel may report a different sentinel
-#value for those slots.
+        # LSE: ignore positions that the reference left at +inf
+        # (no attendable K) since the kernel may report a different sentinel
+        # value for those slots.
         finite = torch.isfinite(lse_ref) & torch.isfinite(lse_cpu)
         if finite.any():
             torch.testing.assert_close(
                 lse_cpu[finite], lse_ref[finite], atol=5e-3, rtol=1e-2
             )
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-#Tests : sweep page_size, layout(KV cache "dtype"), and index dtype.
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+    # ------------------------------------------------------------------
+    # Tests: sweep page_size, layout (KV cache "dtype"), and index dtype.
+    # ------------------------------------------------------------------
     def test_basic_layouts_page_sizes_and_idx_dtypes(self):
         configs = list(
             itertools.product(
@@ -251,10 +320,10 @@ import itertools import unittest
                 )
 
     def test_varying_batch_seq_and_topk(self):
-#Cover non - trivial batch / s_q / topk combinations that are not
-#exact multiples of the kernel's BLOCK_N (128).
+        # Cover non-trivial batch / s_q / topk combinations that are not
+        # exact multiples of the kernel's BLOCK_N (128).
         configs = [
-#(b, s_q, h_q, topk, page_size, num_blocks, fp8_layout)
+            # (b, s_q, h_q, topk, page_size, num_blocks, fp8_layout)
             (1, 1, 16,  64,  64, 4, 1),
             (1, 2, 32, 100,  64, 4, 2),
             (3, 1, 16, 200, 128, 3, 1),
@@ -310,8 +379,8 @@ import itertools import unittest
                 )
 
     def test_with_short_topk_length(self):
-#Covers the optimized path that stops processing once topk_length is
-#reached instead of iterating over the full preallocated topk width.
+        # Covers the optimized path that stops processing once topk_length is
+        # reached instead of iterating over the full preallocated topk width.
         for is_fp8_kvcache in (True, False):
             with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
                 self._run_one(
@@ -333,8 +402,8 @@ import itertools import unittest
                 )
 
     def test_with_invalid_indices(self):
-#Some indices set to - 1; the kernel must mask them out and the
-#reference output must still match.
+        # Some indices set to -1; the kernel must mask them out and the
+        # reference output must still match.
         for fp8_layout in (1, 2):
             with self.subTest(fp8_layout=fp8_layout):
                 self._run_one(
@@ -349,8 +418,8 @@ import itertools import unittest
                 )
 
     def test_with_all_invalid_tile(self):
-#A fully invalid sparse tile should be skipped without changing the
-#online - softmax state; the query becomes lonely and returns zero / +inf.
+        # A fully invalid sparse tile should be skipped without changing the
+        # online-softmax state; the query becomes lonely and returns zero/+inf.
         for is_fp8_kvcache in (True, False):
             with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
                 self._run_one(
@@ -366,8 +435,8 @@ import itertools import unittest
                 )
 
     def test_with_extra_kv_cache(self):
-#Exercise the "main + extra" KV - cache concatenation path
-#(used by DSv4's chunked KV cache layout).
+        # Exercise the "main + extra" KV-cache concatenation path
+        # (used by DSv4's chunked KV cache layout).
         for fp8_layout in (1, 2):
             for have_topk_length, have_extra_topk_length in (
                 (False, False),
@@ -393,8 +462,8 @@ import itertools import unittest
                     )
 
     def test_with_bf16_kv_cache(self):
-#Non - FP8 KV cache should skip dequantization and use BF16 cache rows
-#directly for both main and extra KV sources.
+        # Non-FP8 KV cache should skip dequantization and use BF16 cache rows
+        # directly for both main and extra KV sources.
         for have_extra in (False, True):
             with self.subTest(have_extra=have_extra):
                 self._run_one(
@@ -414,8 +483,8 @@ import itertools import unittest
                 )
 
     def test_oversized_preallocated_kv_cache(self):
-#Only the token range implied by indices should be considered active;
-#the backing KV cache can be much larger because it is preallocated.
+        # Only the token range implied by indices should be considered active;
+        # the backing KV cache can be much larger because it is preallocated.
         for is_fp8_kvcache in (True, False):
             with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
                 self._run_one(
@@ -436,7 +505,7 @@ import itertools import unittest
                 )
 
     def test_with_attn_sink_and_extra(self):
-#Combined : attn_sink + topk_length + extra K cache, both layouts.
+        # Combined: attn_sink + topk_length + extra K cache, both layouts.
         for fp8_layout in (1, 2):
             with self.subTest(fp8_layout=fp8_layout):
                 self._run_one(
