@@ -205,8 +205,8 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
-std::tuple<at::Tensor, at::Tensor> act_quant_cpu(
-    at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt);
+std::tuple<at::Tensor, at::Tensor>
+act_quant_cpu(at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt);
 at::Tensor fused_scale_cpu(at::Tensor& weight, double out_scale, at::Tensor& q_scale);
 
 // igemm
@@ -256,8 +256,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
 #endif
 
 // gemm
-at::Tensor
-weight_packed_linear(
+at::Tensor weight_packed_linear(
     at::Tensor& mat1,
     at::Tensor& mat2,
     const std::optional<at::Tensor>& bias,
@@ -438,24 +437,13 @@ void set_k_and_s_cpu(
     int64_t page_size);
 
 // set_k
-void set_k_cpu(
-    at::Tensor& buf,
-    at::Tensor& loc,
-    at::Tensor& index_k,
-    int64_t page_size,
-    int64_t index_head_dim);
+void set_k_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k, int64_t page_size, int64_t index_head_dim);
 
 // set_s
-void set_s_cpu(
-    at::Tensor& buf,
-    at::Tensor& loc,
-    at::Tensor& index_k_scale,
-    int64_t page_size,
-    int64_t index_head_dim);
+void set_s_cpu(at::Tensor& buf, at::Tensor& loc, at::Tensor& index_k_scale, int64_t page_size, int64_t index_head_dim);
 
 // quant_to_nope_fp8_rope_bf16_pack
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
 
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
@@ -541,11 +529,7 @@ void alloc_extend_kernel_cpu(
     int64_t page_size);
 
 void alloc_decode_kernel_cpu(
-    at::Tensor& seq_lens,
-    at::Tensor& last_loc,
-    at::Tensor& free_pages,
-    at::Tensor& out_indices,
-    int64_t page_size);
+    at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_pages, at::Tensor& out_indices, int64_t page_size);
 
 // mhc kernels
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
@@ -727,7 +711,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #endif
 
   // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, ScalarType? out_dtype=None) -> Tensor");
+  m.def(
+      "weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, ScalarType? out_dtype=None) -> "
+      "Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
 
   // gemm fusion
@@ -846,8 +832,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("set_s_cpu", torch::kCPU, &set_s_cpu);
 
   // quant_to_nope_fp8_rope_bf16_pack
-  m.def(
-      "quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
+  m.def("quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
   m.impl("quant_to_nope_fp8_rope_bf16_pack_cpu", torch::kCPU, &quant_to_nope_fp8_rope_bf16_pack_cpu);
 
   // fused_sigmoid_gating_delta_rule_update

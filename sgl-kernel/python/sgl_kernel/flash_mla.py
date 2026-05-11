@@ -164,21 +164,6 @@ def flash_mla_sparse_fwd(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Intel CPU AMX implementation of flash_mla_with_kvcache (sparse decode).
-#
-# Mirrors the upstream FlashMLA `flash_mla_with_kvcache` interface so the same
-# call-site in `flash_mla_with_kvcache_torch` /
-# `flash_mla_with_kvcache_entrypoint` can dispatch to either CUDA or CPU AMX.
-# ---------------------------------------------------------------------------
-
-# FP8 K-cache layout id, must match FP8KVCacheLayout in
-# python/sglang/srt/flashmla_tests/quant.py and the C++ enum in
-# sgl-kernel/csrc/cpu/flash_mla.cpp.
-_FP8_LAYOUT_V32 = 1
-_FP8_LAYOUT_MODEL1 = 2
-
-
 def flash_mla_with_kvcache_cpu(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -196,13 +181,9 @@ def flash_mla_with_kvcache_cpu(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    fp8_layout: int = _FP8_LAYOUT_MODEL1,
+    fp8_layout: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Intel CPU AMX implementation of FlashMLA's sparse decode.
-
-    Arguments mirror :func:`flash_mla_with_kvcache` (and the reference
-    ``flash_mla_with_kvcache_torch``).  The sparse path supports FP8 KV cache
-    (with dequantization) and BF16 KV cache (without dequantization).
 
     Returns:
         out: ``(B, S_q, H_q, head_dim_v)``, ``bfloat16``.

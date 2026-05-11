@@ -1,30 +1,3 @@
-// Intel CPU AMX implementation of FlashMLA's `flash_mla_with_kvcache` for the
-// sparse decode path used by DeepSeek-V3.2 / DSv4 reference.
-//
-// This kernel mirrors the interface of:
-//   - flash_mla.flash_mla_with_kvcache (DeepSeek FlashMLA upstream)
-//   - flash_mla_with_kvcache_torch (sglang reference @
-//     python/sglang/srt/layers/attention/debug_flash_mla_adapter.py)
-//
-// It follows the same online-softmax + AMX brgemm strategy used by
-// `decode_attention_mla_kernel_impl` in decode.cpp, but:
-//   * K is gathered by per-(batch, query) absolute token indices
-//     (`indices_in_kvcache`) instead of via `req_to_token`.
-//   * K is stored quantized (FP8 NoPE + BF16 RoPE + per-tile scales) and
-//     dequantized while being packed for AMX brgemm.
-//   * Optional `attn_sink` (per-head bias added in log-sum-exp space) and
-//     `topk_length` (variable-length top-k mask) are supported.
-//   * Optional `extra_k_cache` / `extra_indices_in_kvcache` /
-//     `extra_topk_length` are concatenated along the topk axis and processed
-//     in the same online-softmax pass.
-//
-// Returned tensors:
-//   out: (B, S_q, H_q, D_v), bfloat16
-//   lse: (B, H_q, S_q),       float32
-//
-// Parallelism: [batches, S_q, head_blocks, num_kv_splits], identical to the
-// existing CPU MLA decode kernel.
-
 #include <algorithm>
 #include <vector>
 
@@ -35,7 +8,7 @@
 namespace {
 
 // ---------------------------------------------------------------------------
-// FP8 layouts (mirrors python/sglang/srt/flashmla_tests/quant.py)
+// FP8 layouts
 // ---------------------------------------------------------------------------
 //
 // V32_FP8Sparse:    (d=576, d_nope=512, d_rope=64, tile=128, num_tiles=4)
@@ -485,11 +458,6 @@ void sparse_pack_vnni_fp8(
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Helpers shared with decode.cpp (small inline duplicates so we don't have to
-// expose them through a header).
-// ---------------------------------------------------------------------------
-
 template <typename scalar_t>
 inline void fmla_fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
@@ -543,8 +511,6 @@ inline void fmla_finalize_out(scalar_t* __restrict__ out, const float* __restric
 }
 
 // ---------------------------------------------------------------------------
-// Main kernel: sparse MLA decode (AMX BF16 brgemm).
-//
 // query    : [B, S_q, H_q, D_qk]   bf16
 // k_main   : [active_main_tokens, D_qk] bf16 or original fp8 cache storage
 // indices  : [B, S_q, topk_main]        int32/int64
@@ -858,13 +824,6 @@ void sparse_mla_decode_kernel_impl(
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// Public entry point: flash_mla_with_kvcache_cpu
-//
-// Mirrors the sparse decode path of FlashMLA's flash_mla_with_kvcache.
-// Returns (out, lse).
-// ---------------------------------------------------------------------------
-
 std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     at::Tensor& q,
     at::Tensor& k_cache,
@@ -878,8 +837,6 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     std::optional<at::Tensor> extra_topk_length,
     bool is_fp8_kvcache,
     int64_t fp8_layout) {
-  RECORD_FUNCTION("sgl-kernel::flash_mla_with_kvcache_cpu", std::vector<c10::IValue>({q, k_cache, indices}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_DIM(4, q);  // [B, S_q, H_q, D_qk]
   CHECK_DIM(4, k_cache);
@@ -1105,6 +1062,3 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
 
   return std::make_tuple(out, lse);
 }
-
-// Note: operator registration lives in torch_extension_cpu.cpp like the
-// other CPU attention kernels.
