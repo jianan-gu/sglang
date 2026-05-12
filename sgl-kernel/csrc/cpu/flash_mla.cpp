@@ -16,7 +16,7 @@ namespace {
 //   = 512 + 16 + 128 = 656 bytes
 //   tokens are tightly packed:  [num_blocks, block_size, 656]
 //
-// MODEL1_FP8Sparse: (d=512, d_nope=448, d_rope=64, tile=64,  num_tiles=7)
+// V4_FP8Sparse: (d=512, d_nope=448, d_rope=64, tile=64,  num_tiles=7)
 //   per block:
 //     [block_size * (d_nope + 2*d_rope) bytes  ; FP8 NoPE + bf16 RoPE interleaved per token]
 //     [block_size * 8 bytes                    ; 7 e8m0 scales per token + 1 byte pad]
@@ -24,7 +24,7 @@ namespace {
 //
 enum FP8KVCacheLayout : int64_t {
   kV32FP8Sparse = 1,    // FP8KVCacheLayout.V32_FP8Sparse
-  kModel1FP8Sparse = 2  // FP8KVCacheLayout.MODEL1_FP8Sparse
+  kV4FP8Sparse = 2  // FP8KVCacheLayout.V4_FP8Sparse
 };
 
 struct FP8LayoutMeta {
@@ -39,7 +39,7 @@ inline FP8LayoutMeta get_fp8_meta(int64_t layout) {
   switch (layout) {
     case kV32FP8Sparse:
       return {576, 512, 64, 128, 4};
-    case kModel1FP8Sparse:
+    case kV4FP8Sparse:
       return {512, 448, 64, 64, 7};
     default:
       TORCH_CHECK(false, "flash_mla_with_kvcache_cpu: unsupported FP8 layout ", layout);
@@ -159,7 +159,7 @@ inline __attribute__((always_inline)) __m512i cvt_fp8_32_to_scaled_bf16(__m256i 
 template <int64_t LAYOUT>
 inline __attribute__((always_inline)) __m512i load_fp8_kvcache_32_from_row(
     const uint8_t* __restrict__ row_base, const uint8_t* __restrict__ scale_base, int dim_offset) {
-  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
+  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kV4FP8Sparse, "bad layout");
   constexpr FP8LayoutMeta meta =
       (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4} : FP8LayoutMeta{512, 448, 64, 64, 7};
 
@@ -191,7 +191,7 @@ inline __attribute__((always_inline)) void init_fp8_kvcache_tile_rows(
     const int64_t token_idx,
     const uint8_t*& row_base,
     const uint8_t*& scale_base) {
-  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
+  static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kV4FP8Sparse, "bad layout");
   constexpr FP8LayoutMeta meta =
       (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4} : FP8LayoutMeta{512, 448, 64, 64, 7};
   const int64_t block_idx = token_idx / block_size;
@@ -659,7 +659,7 @@ void sparse_mla_decode_kernel_impl(
                   /* ld_dst0 */ static_cast<int>(BLOCK_N),
                   /* ld_dst1 */ static_cast<int>(head_size_v));
             } else {
-              sparse_pack_vnni_fp8<kModel1FP8Sparse, scalar_t, index_t>(
+              sparse_pack_vnni_fp8<kV4FP8Sparse, scalar_t, index_t>(
                   /*    dst0 */ Btmp0,
                   /*    dst1 */ Btmp1,
                   /*     src */ fp8_ptr,
