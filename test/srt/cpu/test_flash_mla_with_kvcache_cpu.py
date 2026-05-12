@@ -23,9 +23,9 @@ _LAYOUT_DIMS = {
 
 
 def _ref_sparse_attn_decode(
-    q: torch.Tensor,                            # [B, S_q, H_q, D_qk] bf16
-    k_dequant: torch.Tensor,                    # [num_blocks, page_size, 1, D_qk] bf16
-    indices: torch.Tensor,                      # [B, S_q, topk] int32
+    q: torch.Tensor,  # [B, S_q, H_q, D_qk] bf16
+    k_dequant: torch.Tensor,  # [num_blocks, page_size, 1, D_qk] bf16
+    indices: torch.Tensor,  # [B, S_q, topk] int32
     topk_length,
     attn_sink,
     extra_k_dequant,
@@ -34,8 +34,7 @@ def _ref_sparse_attn_decode(
     sm_scale: float,
     d_v: int,
 ):
-    """Pure-PyTorch reference for the sparse FP8 decode kernel.
-    """
+    """Pure-PyTorch reference for the sparse FP8 decode kernel."""
     b, s_q, h_q, d_qk = q.shape
 
     def _gather(k_dq: torch.Tensor, idxs: torch.Tensor, tl):
@@ -278,8 +277,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     def test_basic_layouts_and_page_sizes(self):
         configs = list(
             itertools.product(
-                [64, 128, 256],                  # page_size
-                [1, 2],                     # fp8_layout (V32 / V4)
+                [64, 128, 256],  # page_size
+                [1, 2],  # fp8_layout (V32 / V4)
             )
         )
         for page_size, fp8_layout in configs:

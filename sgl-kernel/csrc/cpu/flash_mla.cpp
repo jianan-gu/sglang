@@ -23,8 +23,8 @@ namespace {
 //   block stride is padded up to a multiple of 576 bytes.
 //
 enum FP8KVCacheLayout : int64_t {
-  kV32FP8Sparse = 1,    // FP8KVCacheLayout.V32_FP8Sparse
-  kV4FP8Sparse = 2  // FP8KVCacheLayout.V4_FP8Sparse
+  kV32FP8Sparse = 1,  // FP8KVCacheLayout.V32_FP8Sparse
+  kV4FP8Sparse = 2    // FP8KVCacheLayout.V4_FP8Sparse
 };
 
 struct FP8LayoutMeta {
@@ -135,7 +135,6 @@ inline bool is_valid_sparse_index(index_t idx, int64_t pos, int64_t topk_limit, 
   const int64_t v = static_cast<int64_t>(idx);
   return pos < topk_limit && v >= 0 && v < total_tokens;
 }
-
 
 #if defined(CPU_CAPABILITY_AVX512)
 inline __attribute__((always_inline)) __m512i cvt_fp8_32_to_scaled_bf16(__m256i fp8, float scale) {
@@ -876,8 +875,8 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   int64_t total_tokens_main = 0;
   int64_t total_tokens_extra = 0;
 
-  total_tokens_main = infer_active_total_tokens<int32_t>(
-      indices.data_ptr<int32_t>(), B, S_q, topk_main, capacity_main, tl_main_ptr);
+  total_tokens_main =
+      infer_active_total_tokens<int32_t>(indices.data_ptr<int32_t>(), B, S_q, topk_main, capacity_main, tl_main_ptr);
   if (has_extra) {
     total_tokens_extra = infer_active_total_tokens<int32_t>(
         extra_indices.value().data_ptr<int32_t>(), B, S_q, topk_extra, capacity_extra, tl_extra_ptr);
