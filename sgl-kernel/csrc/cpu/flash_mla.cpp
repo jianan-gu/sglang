@@ -547,7 +547,7 @@ inline void fmla_finalize_out(scalar_t* __restrict__ out, const float* __restric
 //
 // query    : [B, S_q, H_q, D_qk]   bf16
 // k_main   : [active_main_tokens, D_qk] bf16 or original fp8 cache storage
-// indices  : [B, S_q, topk_main]        int32/int64
+// indices  : [B, S_q, topk_main]        int32
 // k_extra  : optional extra KV source with its own indices
 // topk_len : [B]                   int32 or null
 // attn_sink: [H_q]                 float32 or null
@@ -889,8 +889,8 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
       "flash_mla_with_kvcache_cpu: only bfloat16 query is supported, got ",
       q.scalar_type());
   TORCH_CHECK(
-      indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong,
-      "flash_mla_with_kvcache_cpu: indices must be int32 or int64, got ",
+      indices.scalar_type() == at::kInt,
+      "flash_mla_with_kvcache_cpu: indices must be int32, got ",
       indices.scalar_type());
 
   const int64_t B = q.size(0);
@@ -912,8 +912,7 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   if (has_extra) {
     CHECK_EQ(extra_indices.value().size(0), B);
     CHECK_EQ(extra_indices.value().size(1), S_q);
-    TORCH_CHECK(
-        extra_indices.value().scalar_type() == indices.scalar_type(), "extra_indices dtype must match indices dtype");
+    TORCH_CHECK(extra_indices.value().scalar_type() == at::kInt, "extra_indices must be int32");
   }
 
   if (topk_length.has_value()) {
@@ -936,20 +935,11 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   int64_t total_tokens_main = 0;
   int64_t total_tokens_extra = 0;
 
-  if (indices.scalar_type() == at::kInt) {
-    total_tokens_main =
-        infer_active_total_tokens<int32_t>(indices.data_ptr<int32_t>(), B, S_q, topk_main, capacity_main, tl_main_ptr);
-    if (has_extra) {
-      total_tokens_extra = infer_active_total_tokens<int32_t>(
-          extra_indices.value().data_ptr<int32_t>(), B, S_q, topk_extra, capacity_extra, tl_extra_ptr);
-    }
-  } else {
-    total_tokens_main =
-        infer_active_total_tokens<int64_t>(indices.data_ptr<int64_t>(), B, S_q, topk_main, capacity_main, tl_main_ptr);
-    if (has_extra) {
-      total_tokens_extra = infer_active_total_tokens<int64_t>(
-          extra_indices.value().data_ptr<int64_t>(), B, S_q, topk_extra, capacity_extra, tl_extra_ptr);
-    }
+  total_tokens_main = infer_active_total_tokens<int32_t>(
+      indices.data_ptr<int32_t>(), B, S_q, topk_main, capacity_main, tl_main_ptr);
+  if (has_extra) {
+    total_tokens_extra = infer_active_total_tokens<int32_t>(
+        extra_indices.value().data_ptr<int32_t>(), B, S_q, topk_extra, capacity_extra, tl_extra_ptr);
   }
 
   const at::BFloat16* k_main_ptr = nullptr;
@@ -1018,90 +1008,46 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   const int64_t extra_idx_strideB = has_extra ? extra_indices.value().stride(0) : 0;
   const int64_t extra_idx_strideS = has_extra ? extra_indices.value().stride(1) : 0;
 
-  // 5) dispatch on indices dtype
-  if (indices.scalar_type() == at::kInt) {
-    sparse_mla_decode_kernel_impl<at::BFloat16, int32_t, BLOCK_N>(
-        out.data_ptr<at::BFloat16>(),
-        lse.data_ptr<float>(),
-        q.data_ptr<at::BFloat16>(),
-        k_main_ptr,
-        k_extra_ptr,
-        k_main_fp8_info.data,
-        k_extra_fp8_info.data,
-        indices.data_ptr<int32_t>(),
-        has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
-        tl_main_ptr,
-        tl_extra_ptr,
-        attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
-        buffer.data_ptr<at::BFloat16>(),
-        B,
-        S_q,
-        H_q,
-        D_qk,
-        D_v,
-        is_fp8_kvcache,
-        fp8_layout,
-        topk_main,
-        topk_extra,
-        total_tokens_main,
-        total_tokens_extra,
-        q_strideB,
-        q_strideS,
-        q_strideH,
-        k_main_strideN,
-        k_extra_strideN,
-        k_main_fp8_info.block_size,
-        k_extra_fp8_info.block_size,
-        k_main_fp8_info.block_stride_bytes,
-        k_extra_fp8_info.block_stride_bytes,
-        idx_strideB,
-        idx_strideS,
-        extra_idx_strideB,
-        extra_idx_strideS,
-        static_cast<float>(softmax_scale),
-        buffer_size_per_thread);
-  } else {
-    sparse_mla_decode_kernel_impl<at::BFloat16, int64_t, BLOCK_N>(
-        out.data_ptr<at::BFloat16>(),
-        lse.data_ptr<float>(),
-        q.data_ptr<at::BFloat16>(),
-        k_main_ptr,
-        k_extra_ptr,
-        k_main_fp8_info.data,
-        k_extra_fp8_info.data,
-        indices.data_ptr<int64_t>(),
-        has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
-        tl_main_ptr,
-        tl_extra_ptr,
-        attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
-        buffer.data_ptr<at::BFloat16>(),
-        B,
-        S_q,
-        H_q,
-        D_qk,
-        D_v,
-        is_fp8_kvcache,
-        fp8_layout,
-        topk_main,
-        topk_extra,
-        total_tokens_main,
-        total_tokens_extra,
-        q_strideB,
-        q_strideS,
-        q_strideH,
-        k_main_strideN,
-        k_extra_strideN,
-        k_main_fp8_info.block_size,
-        k_extra_fp8_info.block_size,
-        k_main_fp8_info.block_stride_bytes,
-        k_extra_fp8_info.block_stride_bytes,
-        idx_strideB,
-        idx_strideS,
-        extra_idx_strideB,
-        extra_idx_strideS,
-        static_cast<float>(softmax_scale),
-        buffer_size_per_thread);
-  }
+  sparse_mla_decode_kernel_impl<at::BFloat16, int32_t, BLOCK_N>(
+      out.data_ptr<at::BFloat16>(),
+      lse.data_ptr<float>(),
+      q.data_ptr<at::BFloat16>(),
+      k_main_ptr,
+      k_extra_ptr,
+      k_main_fp8_info.data,
+      k_extra_fp8_info.data,
+      indices.data_ptr<int32_t>(),
+      has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
+      tl_main_ptr,
+      tl_extra_ptr,
+      attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
+      buffer.data_ptr<at::BFloat16>(),
+      B,
+      S_q,
+      H_q,
+      D_qk,
+      D_v,
+      is_fp8_kvcache,
+      fp8_layout,
+      topk_main,
+      topk_extra,
+      total_tokens_main,
+      total_tokens_extra,
+      q_strideB,
+      q_strideS,
+      q_strideH,
+      k_main_strideN,
+      k_extra_strideN,
+      k_main_fp8_info.block_size,
+      k_extra_fp8_info.block_size,
+      k_main_fp8_info.block_stride_bytes,
+      k_extra_fp8_info.block_stride_bytes,
+      idx_strideB,
+      idx_strideS,
+      extra_idx_strideB,
+      extra_idx_strideS,
+      static_cast<float>(softmax_scale),
+      buffer_size_per_thread);
 
   return std::make_tuple(out, lse);
 }

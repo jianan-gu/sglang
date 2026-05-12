@@ -27,7 +27,7 @@ _LAYOUT_DIMS = {
 def _ref_sparse_attn_decode(
     q: torch.Tensor,                            # [B, S_q, H_q, D_qk] bf16
     k_dequant: torch.Tensor,                    # [num_blocks, page_size, 1, D_qk] bf16
-    indices: torch.Tensor,                      # [B, S_q, topk] int32/int64
+    indices: torch.Tensor,                      # [B, S_q, topk] int32
     topk_length,
     attn_sink,
     extra_k_dequant,
@@ -106,7 +106,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     """Tests for ``flash_mla_with_kvcache_cpu`` (sparse FP8 decode, CPU AMX).
     Only ``torch.bfloat16`` queries are supported by the kernel
     (see ``sgl-kernel/csrc/cpu/flash_mla.cpp``); ``page_size`` and the FP8
-    KV-cache layout / index dtype are the dimensions we sweep here.
+    KV-cache layout are the dimensions we sweep here.
     """
 
     def setUp(self):
@@ -305,21 +305,19 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
             )
 
     # ------------------------------------------------------------------
-    # Tests: sweep page_size, layout (KV cache "dtype"), and index dtype.
+    # Tests: sweep page_size and layout (KV cache "dtype").
     # ------------------------------------------------------------------
-    def test_basic_layouts_page_sizes_and_idx_dtypes(self):
+    def test_basic_layouts_and_page_sizes(self):
         configs = list(
             itertools.product(
                 [64, 128, 256],                  # page_size
                 [1, 2],                     # fp8_layout (V32 / MODEL1)
-                [torch.int32, torch.int64], # idx_dtype
             )
         )
-        for page_size, fp8_layout, idx_dtype in configs:
+        for page_size, fp8_layout in configs:
             with self.subTest(
                 page_size=page_size,
                 fp8_layout=fp8_layout,
-                idx_dtype=str(idx_dtype),
             ):
                 self._run_one(
                     b=2,
@@ -329,7 +327,6 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     page_size=page_size,
                     num_blocks=4,
                     fp8_layout=fp8_layout,
-                    idx_dtype=idx_dtype,
                 )
 
     def test_varying_batch_seq_and_topk(self):
