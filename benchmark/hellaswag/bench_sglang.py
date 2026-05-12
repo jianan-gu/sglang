@@ -1,10 +1,11 @@
 import argparse
 import json
+import os
 import time
 
 import numpy as np
 
-from sglang.api import set_default_backend
+from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -31,9 +32,11 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
+    data_path = args.data_path
     url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    if not os.path.isfile(data_path):
+        data_path = download_and_cache_file(url)
+    lines = list(read_jsonl(data_path))
 
     # Construct prompts
     num_questions = args.num_questions
@@ -65,7 +68,7 @@ def main(args):
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     rets = few_shot_hellaswag.run_batch(
         arguments,
         temperature=0,
@@ -73,7 +76,7 @@ def main(args):
         progress_bar=True,
     )
     preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))

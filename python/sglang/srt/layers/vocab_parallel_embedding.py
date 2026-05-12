@@ -1,65 +1,51 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
-from vllm.distributed import (
+
+from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.parameter import BasevLLMParameter
-
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
+from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cpu,
+    is_npu,
+    set_weight_attrs,
+)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+_is_npu = is_npu()
 
-class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-    """Unquantized method for embeddings."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for embedding layer."""
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
-
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
+logger = logging.getLogger(__name__)
 
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
@@ -143,7 +129,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.jit.script
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -152,7 +138,7 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # torch.jit.script will fuse all of the pointwise ops below
+    # torch.compile will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
     added_vocab_mask = (input_ >= added_vocab_start_index) & (
@@ -214,28 +200,51 @@ class VocabParallelEmbedding(torch.nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        *,
         params_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_tp: bool = True,
+        use_attn_tp_group: bool = False,
+        use_presharded_weights: bool = False,
     ):
         super().__init__()
         self.quant_config = quant_config
 
         self.enable_tp = enable_tp
+        self.use_attn_tp_group = use_attn_tp_group
         if self.enable_tp:
-            tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            if use_attn_tp_group:
+                tp_rank = get_attention_tp_rank()
+                self.tp_size = get_attention_tp_size()
+            else:
+                tp_rank = get_tensor_model_parallel_rank()
+                self.tp_size = get_tensor_model_parallel_world_size()
         else:
+            assert use_attn_tp_group is False
             tp_rank = 0
             self.tp_size = 1
 
         self.num_embeddings = num_embeddings
-        self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
+
+        # Support the case where the vocab size is not divisible by the TP size.
+        if (
+            _is_cpu
+            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
+        ):
+            padding_size *= self.tp_size
+        self.padding_size = padding_size
+
         num_added_embeddings = num_embeddings - self.org_vocab_size
+        self.use_presharded_weights = use_presharded_weights
+        if use_presharded_weights:
+            assert (
+                num_added_embeddings == 0
+            ), "Lora is not supported with presharded weights."
+
         self.org_vocab_size_padded = pad_vocab_size(
             self.org_vocab_size, self.padding_size
         )
@@ -254,26 +263,26 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         self.embedding_dim = embedding_dim
 
-        linear_method = None
+        quant_method = None
         if quant_config is not None:
-            linear_method = quant_config.get_quant_method(self, prefix=prefix)
-        if linear_method is None:
-            linear_method = UnquantizedEmbeddingMethod()
+            quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if quant_method is None:
+            quant_method = UnquantizedEmbeddingMethod()
 
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
         # layer type like ParallelLMHead, this is not important.
         is_embedding_layer = type(self.__class__) is VocabParallelEmbedding
-        linear_method_implements_embedding = method_has_implemented_embedding(
-            type(linear_method)
+        quant_method_implements_embedding = method_has_implemented_embedding(
+            type(quant_method)
         )
-        if is_embedding_layer and not linear_method_implements_embedding:
+        if is_embedding_layer and not quant_method_implements_embedding:
             raise NotImplementedError(
-                f"The class {type(linear_method).__name__} must implement "
+                f"The class {type(quant_method).__name__} must implement "
                 "the 'embedding' method, see UnquantizedEmbeddingMethod."
             )
 
-        self.linear_method: QuantizeMethodBase = linear_method
+        self.quant_method: QuantizeMethodBase = quant_method
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -294,7 +303,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             - self.shard_indices.added_vocab_start_index
         )
 
-        self.linear_method.create_weights(
+        self.quant_method.create_weights(
             self,
             self.embedding_dim,
             [self.num_embeddings_per_partition],
@@ -439,7 +448,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             packed_factor = (
                 param.packed_factor
                 if isinstance(param, BasevLLMParameter)
-                else param.pack_factor
+                else param.packed_factor
             )
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size // param.packed_factor
@@ -447,10 +456,14 @@ class VocabParallelEmbedding(torch.nn.Module):
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
         else:
-            assert loaded_weight.shape[output_dim] == self.org_vocab_size
+            assert loaded_weight.shape[output_dim] == (
+                self.org_vocab_size
+                // (self.tp_size if self.use_presharded_weights else 1)
+            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
 
         # Copy the data.
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        if not self.use_presharded_weights:
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
@@ -467,16 +480,21 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         else:
             masked_input = input_
+
         # Get the embeddings.
-        output_parallel = self.linear_method.embedding(self, masked_input.long())
-        # Mask the output embedding.
+        with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
+
         if self.tp_size > 1:
+            # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
-        return output
+            if not get_attn_tp_context().input_scattered:
+                if self.use_attn_tp_group:
+                    output_parallel = attn_tp_all_reduce(output_parallel)
+                else:
+                    # Reduce across all the model parallel GPUs.
+                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
@@ -508,23 +526,37 @@ class ParallelLMHead(VocabParallelEmbedding):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        *,
         bias: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_attn_tp_group: bool = False,
+        use_presharded_weights: bool = False,
     ):
         super().__init__(
             num_embeddings,
             embedding_dim,
-            params_dtype,
-            org_num_embeddings,
-            padding_size,
-            quant_config,
-            prefix,
+            params_dtype=params_dtype,
+            org_num_embeddings=org_num_embeddings,
+            padding_size=padding_size,
+            quant_config=quant_config,
+            prefix=prefix,
+            use_attn_tp_group=use_attn_tp_group,
+            use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config
+
+        # We only support pack LMHead if it's not quantized.
+        if _is_cpu and _is_cpu_amx_available:
+            if hasattr(self, "weight") and self.weight.dtype in [
+                torch.bfloat16,
+                torch.float16,
+            ]:
+                self.quant_method = PackWeightMethod(weight_names=["weight"])
+
         if bias:
             self.bias = Parameter(
                 torch.empty(self.num_embeddings_per_partition, dtype=params_dtype)

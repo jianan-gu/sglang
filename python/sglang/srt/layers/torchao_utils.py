@@ -2,11 +2,37 @@
 Common utilities for torchao.
 """
 
+import logging
+from typing import Callable, Optional
+
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def proj_filter(
+    module: torch.nn.Module,
+    fqn: str,
+):
+    """Filter function for quantizing projection layers."""
+    return "proj" in fqn
+
+
+# TODO: implement a more general filter function
+def proj_filter_conv3d(
+    module: torch.nn.Module,
+    fqn: str,
+):
+    if isinstance(module, torch.nn.Conv3d):
+        logger.warning(f"Quantize: skipping {fqn} because it's a Conv3d")
+        return False
+    return "proj" in fqn
 
 
 def apply_torchao_config_to_model(
-    model: torch.nn.Module, torchao_config: str, filter_fn=None
+    model: torch.nn.Module,
+    torchao_config: str,
+    filter_fn: Optional[Callable] = proj_filter,
 ):
     """Quantize a modelwith torchao quantization specified by torchao_config
 
@@ -16,6 +42,9 @@ def apply_torchao_config_to_model(
         quantize the model, e.g. int4wo-128 means int4 weight only quantization with group_size
         128
     """
+    if torchao_config == "" or torchao_config is None:
+        return model
+
     # Lazy import to suppress some warnings
     from torchao.quantization import (
         float8_dynamic_activation_float8_weight,
@@ -27,15 +56,8 @@ def apply_torchao_config_to_model(
     )
     from torchao.quantization.observer import PerRow, PerTensor
 
-    if filter_fn is None:
-
-        def filter_fn(module, fqn):
-            return "proj" in fqn
-
-    if torchao_config == "" or torchao_config is None:
-        return model
-    elif "int8wo" in torchao_config:
-        quantize_(model, int8_weight_only(), filter_fn=filter_fn)
+    if "int8wo" in torchao_config:
+        quantize_(model, int8_weight_only(), filter_fn=proj_filter_conv3d)
     elif "int8dq" in torchao_config:
         quantize_(model, int8_dynamic_activation_int8_weight(), filter_fn=filter_fn)
     elif "int4wo" in torchao_config:
@@ -50,7 +72,7 @@ def apply_torchao_config_to_model(
     elif "fp8wo" in torchao_config:
         # this requires newer hardware
         # [rank0]: AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-        quantize_(model, float8_weight_only(), filter_fn=filter_fn)
+        quantize_(model, float8_weight_only(), filter_fn=proj_filter_conv3d)
     elif "fp8dq" in torchao_config:
         granularity = torchao_config.split("-")[-1]
         GRANULARITY_MAP = {
@@ -65,7 +87,7 @@ def apply_torchao_config_to_model(
             float8_dynamic_activation_float8_weight(
                 granularity=GRANULARITY_MAP[granularity]
             ),
-            filter_fn=filter_fn,
+            filter_fn=proj_filter_conv3d,
         )
     else:
         raise ValueError(f"Unexpected config: {torchao_config}")

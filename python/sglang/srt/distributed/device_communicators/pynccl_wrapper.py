@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/distributed/device_communicators/pynccl.py
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 # This file is a pure Python wrapper for the NCCL library.
 # The main purpose is to use NCCL combined with CUDA graph.
@@ -57,7 +57,7 @@ def find_nccl_library() -> str:
             so_file = "librccl.so.1"
         else:
             raise ValueError("NCCL only supports CUDA and ROCm backends.")
-        logger.info("Found nccl from library %s", so_file)
+        logger.debug("Found nccl from library %s", so_file)
     return so_file
 
 
@@ -67,6 +67,7 @@ def find_nccl_library() -> str:
 
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
+ncclWindow_t = ctypes.c_void_p
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -187,6 +188,63 @@ class NCCLLibrary:
                 cudaStream_t,
             ],
         ),
+        # ncclResult_t  ncclAllGather(
+        #   const void* sendbuff, void* recvbuff, size_t count,
+        #   ncclDataType_t datatype, ncclComm_t comm,
+        #   cudaStream_t stream);
+        # note that cudaStream_t is a pointer type, so the last argument
+        # is a pointer
+        Function(
+            "ncclAllGather",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
+        # ncclResult_t  ncclReduce(
+        #   const void* sendbuff, void* recvbuff, size_t count,
+        #   ncclDataType_t datatype, ncclRedOp_t op, int root,
+        #   ncclComm_t comm,  cudaStream_t stream);
+        # note that cudaStream_t is a pointer type, so the last argument
+        # is a pointer
+        Function(
+            "ncclReduce",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ncclRedOp_t,
+                ctypes.c_int,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
+        # ncclResult_t  ncclReduceScatter(
+        #   const void* sendbuff, void* recvbuff, size_t count,
+        #   ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+        #   cudaStream_t stream);
+        # note that cudaStream_t is a pointer type, so the last argument
+        # is a pointer
+        Function(
+            "ncclReduceScatter",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ncclRedOp_t,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
         # ncclResult_t  ncclSend(
         #   const void* sendbuff, size_t count, ncclDataType_t datatype,
         #   int dest, ncclComm_t comm, cudaStream_t stream);
@@ -217,12 +275,50 @@ class NCCLLibrary:
                 cudaStream_t,
             ],
         ),
+        # ncclResult_t ncclBroadcast(
+        #   const void* sendbuff, void* recvbuff, size_t count,
+        #   ncclDataType_t datatype, int root, ncclComm_t comm,
+        #   cudaStream_t stream);
+        Function(
+            "ncclBroadcast",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ctypes.c_int,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
         # be cautious! this is a collective call, it will block until all
         # processes in the communicator have called this function.
         # because Python object destruction can happen in random order,
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclGroupStart();
+        Function("ncclGroupStart", ncclResult_t, []),
+        # ncclResult_t ncclGroupEnd();
+        Function("ncclGroupEnd", ncclResult_t, []),
+    ]
+
+    exported_functions_symm_mem = [
+        # ncclResult_t ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
+        Function(
+            "ncclCommWindowRegister",
+            ncclResult_t,
+            [
+                ncclComm_t,
+                buffer_type,
+                ctypes.c_size_t,
+                ctypes.POINTER(ncclWindow_t),
+                ctypes.c_int,
+            ],
+        ),
+        # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
+        Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -244,10 +340,10 @@ class NCCLLibrary:
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:
             logger.error(
-                "Failed to load NCCL library from %s ."
-                "It is expected if you are not running on NVIDIA/AMD GPUs."
+                "Failed to load NCCL library from %s . "
+                "It is expected if you are not running on NVIDIA/AMD GPUs. "
                 "Otherwise, the nccl library might not exist, be corrupted "
-                "or it does not support the current platform %s."
+                "or it does not support the current platform %s. "
                 "If you already have the library, please set the "
                 "environment variable SGLANG_NCCL_SO_PATH"
                 " to point to the correct nccl library path.",
@@ -258,7 +354,10 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            for func in NCCLLibrary.exported_functions:
+            exported_functions = NCCLLibrary.exported_functions
+            if hasattr(self.lib, "ncclCommWindowRegister"):
+                exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
+            for func in exported_functions:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
@@ -274,10 +373,14 @@ class NCCLLibrary:
             error_str = self.ncclGetErrorString(result)
             raise RuntimeError(f"NCCL error: {error_str}")
 
-    def ncclGetVersion(self) -> str:
+    def ncclGetRawVersion(self) -> int:
         version = ctypes.c_int()
         self.NCCL_CHECK(self._funcs["ncclGetVersion"](ctypes.byref(version)))
-        version_str = str(version.value)
+        # something like 21903
+        return version.value
+
+    def ncclGetVersion(self) -> str:
+        version_str = str(self.ncclGetRawVersion())
         # something like 21903 --> "2.19.3"
         major = version_str[0].lstrip("0")
         minor = version_str[1:3].lstrip("0")
@@ -321,6 +424,68 @@ class NCCLLibrary:
             )
         )
 
+    def ncclReduce(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        op: int,
+        root: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        # `datatype` actually should be `ncclDataType_t`
+        # and `op` should be `ncclRedOp_t`
+        # both are aliases of `ctypes.c_int`
+        # when we pass int to a function, it will be converted to `ctypes.c_int`
+        # by ctypes automatically
+        self.NCCL_CHECK(
+            self._funcs["ncclReduce"](
+                sendbuff, recvbuff, count, datatype, op, root, comm, stream
+            )
+        )
+
+    def ncclReduceScatter(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        op: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        # `datatype` actually should be `ncclDataType_t`
+        # and `op` should be `ncclRedOp_t`
+        # both are aliases of `ctypes.c_int`
+        # when we pass int to a function, it will be converted to `ctypes.c_int`
+        # by ctypes automatically
+        self.NCCL_CHECK(
+            self._funcs["ncclReduceScatter"](
+                sendbuff, recvbuff, count, datatype, op, comm, stream
+            )
+        )
+
+    def ncclAllGather(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        # `datatype` actually should be `ncclDataType_t`
+        # which is an aliases of `ctypes.c_int`
+        # when we pass int to a function, it will be converted to `ctypes.c_int`
+        # by ctypes automatically
+        self.NCCL_CHECK(
+            self._funcs["ncclAllGather"](
+                sendbuff, recvbuff, count, datatype, comm, stream
+            )
+        )
+
     def ncclSend(
         self,
         sendbuff: buffer_type,
@@ -347,8 +512,44 @@ class NCCLLibrary:
             self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream)
         )
 
+    def ncclBroadcast(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        root: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        self.NCCL_CHECK(
+            self._funcs["ncclBroadcast"](
+                sendbuff, recvbuff, count, datatype, root, comm, stream
+            )
+        )
+
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+
+    def ncclCommWindowRegister(
+        self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int
+    ) -> ncclWindow_t:
+        window = ncclWindow_t()
+        self.NCCL_CHECK(
+            self._funcs["ncclCommWindowRegister"](
+                comm, buff, size, ctypes.byref(window), win_flags
+            )
+        )
+        return window
+
+    def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
+        self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
+
+    def ncclGroupStart(self) -> None:
+        self.NCCL_CHECK(self._funcs["ncclGroupStart"]())
+
+    def ncclGroupEnd(self) -> None:
+        self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
 
 
 __all__ = [

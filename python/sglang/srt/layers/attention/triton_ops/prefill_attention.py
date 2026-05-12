@@ -22,8 +22,12 @@ import torch
 import triton
 import triton.language as tl
 
-is_cuda_available = torch.cuda.is_available()
-if is_cuda_available:
+from sglang.srt.utils import is_cuda, is_hip
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+
+if _is_cuda or _is_hip:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
@@ -166,7 +170,13 @@ def _fwd_kernel(
 def context_attention_fwd(
     q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
 ):
-    if is_cuda_available and CUDA_CAPABILITY[0] > 8:
+    """
+    q, k, v: [b * s, head, head_dim]
+    b_start_loc: [b]
+    b_seq_len: [b]
+    out: [b * s, head, head_dim]
+    """
+    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
         BLOCK = 64

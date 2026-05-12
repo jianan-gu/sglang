@@ -7,7 +7,10 @@ import time
 import numpy as np
 
 import sglang as sgl
+from sglang.srt.utils import is_hip
 from sglang.utils import download_and_cache_file, read_jsonl
+
+_is_hip = is_hip()
 
 
 def test_few_shot_qa():
@@ -370,7 +373,7 @@ def test_dtype_gen():
     @sgl.function
     def dtype_gen(s):
         s += "Q: What is the full name of DNS?\n"
-        s += "A: The full nams is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
+        s += "A: The full names is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
         s += "Q: Which year was DNS invented?\n"
         s += "A: " + sgl.gen("int_res", dtype=int) + "\n"
         s += "Q: What is the value of pi?\n"
@@ -503,18 +506,41 @@ def test_hellaswag_select():
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     rets = few_shot_hellaswag.run_batch(
         arguments,
         temperature=0,
         num_threads=64,
         progress_bar=True,
+        generator_style=False,
     )
-    preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
-    latency = time.time() - tic
+    preds = []
+    for i, ret in enumerate(rets):
+        preds.append(choices[i].index(ret["answer"]))
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     accuracy = np.mean(np.array(preds) == np.array(labels))
+
+    # Test generator style of run_batch
+    tic = time.perf_counter()
+    rets = few_shot_hellaswag.run_batch(
+        arguments,
+        temperature=0,
+        num_threads=64,
+        progress_bar=True,
+        generator_style=True,
+    )
+    preds_gen = []
+    for i, ret in enumerate(rets):
+        preds_gen.append(choices[i].index(ret["answer"]))
+    latency_gen = time.perf_counter() - tic
+
+    # Compute accuracy
+    accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))
+    print(f"{accuracy=}, {accuracy_gen=}")
+    assert np.abs(accuracy_gen - accuracy) < 0.1
+    assert np.abs(latency_gen - latency) < 1 if not _is_hip else 2
 
     return accuracy, latency
 
@@ -528,7 +554,7 @@ def test_gen_min_new_tokens():
     We verify that the number of tokens in the answer is >= the min_tokens threshold.
     """
     import sglang as sgl
-    from sglang.srt.hf_transformers_utils import get_tokenizer
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
     model_path = sgl.global_config.default_backend.endpoint.get_model_name()
     MIN_TOKENS, MAX_TOKENS = 64, 128

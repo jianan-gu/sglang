@@ -24,9 +24,8 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -36,12 +35,16 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
 
 
 class StablelmMLP(nn.Module):
@@ -49,6 +52,7 @@ class StablelmMLP(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -59,12 +63,14 @@ class StablelmMLP(nn.Module):
             [config.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = SiluAndMul()
 
@@ -81,6 +87,7 @@ class StablelmAttention(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -122,24 +129,39 @@ class StablelmAttention(nn.Module):
             self.total_num_heads,
             self.total_num_key_value_heads,
             self.qkv_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.rotary_ndims,
-            max_position=self.config.max_position_embeddings,
-            base=self.config.rope_theta,
-        )
+        if not _is_npu:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.rotary_ndims,
+                max_position=self.config.max_position_embeddings,
+                base=self.config.rope_theta,
+            )
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.rotary_ndims,
+                max_position=self.config.max_position_embeddings,
+                base=self.config.rope_theta,
+                dtype=torch.float32,
+            )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_key_value_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -150,7 +172,12 @@ class StablelmAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if not _is_npu:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            odtype = q.dtype
+            q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
+            q, k = q.to(odtype), k.to(odtype)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -162,10 +189,15 @@ class StablelmDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        self.self_attn = StablelmAttention(config, layer_id=layer_id)
-        self.mlp = StablelmMLP(config, quant_config=quant_config)
+        self.self_attn = StablelmAttention(
+            config, layer_id=layer_id, prefix=add_prefix("self_attn", prefix)
+        )
+        self.mlp = StablelmMLP(
+            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        )
         norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
@@ -200,15 +232,22 @@ class StableLMEpochModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
-                StablelmDecoderLayer(config, i, quant_config=quant_config)
+                StablelmDecoderLayer(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -242,12 +281,17 @@ class StableLmForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = StableLMEpochModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = StableLMEpochModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
