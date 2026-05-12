@@ -25,8 +25,8 @@ _LAYOUT_DIMS = {
 
 
 def _ref_sparse_attn_decode(
-    q: torch.Tensor,                            # [B, S_q, H_q, D_qk] bf16
-    k_dequant: torch.Tensor,                    # [num_blocks, page_size, 1, D_qk] bf16
+    q: torch.Tensor,                            # [B, S_q, H_q, D_qk] fp16/bf16
+    k_dequant: torch.Tensor,                    # [num_blocks, page_size, 1, D_qk]
     indices: torch.Tensor,                      # [B, S_q, topk] int32
     topk_length,
     attn_sink,
@@ -95,7 +95,7 @@ def _ref_sparse_attn_decode(
     )
     lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
 
-    return output.to(torch.bfloat16), lse.transpose(1, 2).contiguous()
+    return output.to(q.dtype), lse.transpose(1, 2).contiguous()
 
 
 @unittest.skipIf(
@@ -104,9 +104,9 @@ def _ref_sparse_attn_decode(
 )
 class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     """Tests for ``flash_mla_with_kvcache_cpu`` (sparse FP8 decode, CPU AMX).
-    Only ``torch.bfloat16`` queries are supported by the kernel
-    (see ``sgl-kernel/csrc/cpu/flash_mla.cpp``); ``page_size`` and the FP8
-    KV-cache layout are the dimensions we sweep here.
+    ``torch.float16`` and ``torch.bfloat16`` queries are supported by the
+    kernel (see ``sgl-kernel/csrc/cpu/flash_mla.cpp``); ``page_size`` and the
+    FP8 KV-cache layout are the dimensions we sweep here.
     """
 
     def setUp(self):
@@ -132,12 +132,12 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
             k_quant = k_quant.view(torch.uint8)
         return k_quant.contiguous(), k_dequant
 
-    def _make_bf16_kv_cache(self, num_blocks, page_size, d_qk):
-        k_bf16 = (
-            torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
+    def _make_kv_cache(self, num_blocks, page_size, d_qk, dtype):
+        k = (
+            torch.randn(num_blocks, page_size, 1, d_qk, dtype=dtype) * 0.5
         )
-        k_bf16 = k_bf16.contiguous()
-        return k_bf16, k_bf16
+        k = k.contiguous()
+        return k, k
 
     def _make_indices(
         self, b, s_q, topk, total_tokens, *, dtype=torch.int32, invalid_ratio=0.0
@@ -167,6 +167,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         num_blocks,
         fp8_layout,
         idx_dtype=torch.int32,
+        q_dtype=torch.bfloat16,
         have_attn_sink=False,
         have_topk_length=False,
         have_extra=False,
@@ -184,7 +185,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         d_qk, d_v = _LAYOUT_DIMS[fp8_layout]
         layout_enum = flashmla_quant.FP8KVCacheLayout(fp8_layout)
 
-        q = torch.randn(b, s_q, h_q, d_qk, dtype=torch.bfloat16) * 0.5
+        q = torch.randn(b, s_q, h_q, d_qk, dtype=q_dtype) * 0.5
 
         if is_fp8_kvcache:
             k_cache, k_dequant = self._make_quantized_kv_cache(
@@ -195,8 +196,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                 as_uint8=fp8_cache_as_uint8,
             )
         else:
-            k_cache, k_dequant = self._make_bf16_kv_cache(
-                num_blocks, page_size, d_qk
+            k_cache, k_dequant = self._make_kv_cache(
+                num_blocks, page_size, d_qk, q_dtype
             )
         total_tokens = valid_tokens if valid_tokens is not None else (num_blocks * page_size)
         indices = self._make_indices(
@@ -230,8 +231,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     as_uint8=fp8_cache_as_uint8,
                 )
             else:
-                extra_k_cache, extra_k_dequant = self._make_bf16_kv_cache(
-                    extra_num_blocks, page_size, d_qk
+                extra_k_cache, extra_k_dequant = self._make_kv_cache(
+                    extra_num_blocks, page_size, d_qk, q_dtype
                 )
             extra_total_tokens = (
                 extra_valid_tokens
@@ -288,7 +289,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         # Shape / dtype contract.
         self.assertEqual(tuple(out_cpu.shape), (b, s_q, h_q, d_v))
         self.assertEqual(tuple(lse_cpu.shape), (b, h_q, s_q))
-        self.assertEqual(out_cpu.dtype, torch.bfloat16)
+        self.assertEqual(out_cpu.dtype, q_dtype)
         self.assertEqual(lse_cpu.dtype, torch.float32)
 
         # Numerical check.  Tolerances mirror the loosened thresholds used by
@@ -305,19 +306,21 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
             )
 
     # ------------------------------------------------------------------
-    # Tests: sweep page_size and layout (KV cache "dtype").
+    # Tests: sweep page_size, q/output dtype, and layout (KV cache "dtype").
     # ------------------------------------------------------------------
     def test_basic_layouts_and_page_sizes(self):
         configs = list(
             itertools.product(
                 [64, 128, 256],                  # page_size
                 [1, 2],                     # fp8_layout (V32 / MODEL1)
+                [torch.bfloat16, torch.float16], # q/output dtype
             )
         )
-        for page_size, fp8_layout in configs:
+        for page_size, fp8_layout, q_dtype in configs:
             with self.subTest(
                 page_size=page_size,
                 fp8_layout=fp8_layout,
+                q_dtype=str(q_dtype),
             ):
                 self._run_one(
                     b=2,
@@ -327,6 +330,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     page_size=page_size,
                     num_blocks=4,
                     fp8_layout=fp8_layout,
+                    q_dtype=q_dtype,
                 )
 
     def test_varying_batch_seq_and_topk(self):
@@ -489,11 +493,13 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     fp8_cache_as_uint8=True,
                 )
 
-    def test_with_bf16_kv_cache(self):
-        # Non-FP8 KV cache should skip dequantization and use BF16 cache rows
-        # directly for both main and extra KV sources.
-        for have_extra in (False, True):
-            with self.subTest(have_extra=have_extra):
+    def test_with_reduced_float_kv_cache(self):
+        # Non-FP8 KV cache should skip dequantization and use cache rows with
+        # the same dtype as q directly for both main and extra KV sources.
+        for q_dtype, have_extra in itertools.product(
+            (torch.bfloat16, torch.float16), (False, True)
+        ):
+            with self.subTest(q_dtype=str(q_dtype), have_extra=have_extra):
                 self._run_one(
                     b=2,
                     s_q=1,
@@ -508,6 +514,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     have_topk_length=True,
                     have_extra_topk_length=have_extra,
                     is_fp8_kvcache=False,
+                    q_dtype=q_dtype,
                 )
 
     def test_oversized_preallocated_kv_cache(self):

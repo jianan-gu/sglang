@@ -193,10 +193,10 @@ def flash_mla_with_kvcache_cpu(
 
     Arguments mirror :func:`flash_mla_with_kvcache` (and the reference
     ``flash_mla_with_kvcache_torch``).  The sparse path supports FP8 KV cache
-    (with dequantization) and BF16 KV cache (without dequantization).
+    (with dequantization) and reduced floating-point KV cache (without dequantization).
 
     Returns:
-        out: ``(B, S_q, H_q, head_dim_v)``, ``bfloat16``.
+        out: ``(B, S_q, H_q, head_dim_v)``, same dtype as ``q``.
         softmax_lse: ``(B, H_q, S_q)``, ``float32``.
     """
     assert indices is not None, (
