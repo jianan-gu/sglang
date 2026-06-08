@@ -1203,16 +1203,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-
+        import time
+        s = time.time()
         if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
+            res =  run_dp_sharded_mrope_vision_model(
                 self.visual,
                 pixel_values,
                 image_grid_thw.tolist(),
                 rope_type="rope_3d",
             )
         else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
+            res = self.visual(pixel_values, grid_thw=image_grid_thw)
+        print("[get_image_feature] takes ", time.time() - s , "s")
+        return res
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
