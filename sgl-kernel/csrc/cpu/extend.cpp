@@ -256,12 +256,38 @@ void extend_attention_kernel_impl(
           }
 
           for (int row = 0; row < m_size; ++row) {
-            if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size - 1 &&
-                row + m + 1 < n + sliding_window_size + n_size) {
-              fill_stub(
-                  s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), row + m - n - sliding_window_size + 1);
-            } else if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size) {
-              continue;
+            if (sliding_window_size > 0) {
+              // Sliding-window mask for the extend (self) part. Both query and key
+              // live in the extend segment, so query position is (m + row) and key
+              // position is the column index. The window keeps keys whose distance
+              // to the query is strictly less than sliding_window_size, i.e.
+              //   |query_pos - key_pos| < sliding_window_size.
+              const int q_pos = m + row;
+              // Older side: keys with query_pos - key_pos >= sliding_window_size,
+              //   i.e. key_pos < q_pos - sliding_window_size + 1. Columns
+              //   [n, q_pos - sliding_window_size + 1) of this block are masked.
+              int old_cnt = (q_pos - sliding_window_size + 1) - n;
+              old_cnt = std::min(std::max(old_cnt, 0), n_size);
+              // Newer side: keys with key_pos - query_pos >= sliding_window_size,
+              //   i.e. key_pos >= q_pos + sliding_window_size. This half only matters
+              //   for bidirectional (non-causal) attention; for causal attention these
+              //   future keys are already masked by the triangle above.
+              int new_from = (q_pos + sliding_window_size) - n;
+              new_from = std::min(std::max(new_from, 0), n_size);
+              const bool has_new_mask = (!causal) && (new_from < n_size);
+              // Skip the whole block (no softmax contribution) if every key falls
+              // outside the window: either all keys are too old (old_cnt == n_size)
+              // or all keys are too new (new_from == 0 with a newer-side mask).
+              if (old_cnt >= n_size || (has_new_mask && new_from == 0)) {
+                continue;
+              }
+              float* row_ptr = s_i + row * BLOCK_N;
+              if (old_cnt > 0) {
+                fill_stub(row_ptr, -std::numeric_limits<float>::infinity(), old_cnt);
+              }
+              if (has_new_mask) {
+                fill_stub(row_ptr + new_from, -std::numeric_limits<float>::infinity(), n_size - new_from);
+              }
             }
             flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
                 s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
