@@ -45,7 +45,7 @@ class ReqDllmMixin:
         prefix_length = len(self.prefix_indices)
         min_required_length = prefix_length + self.dllm_config.block_size
 
-        if len(self.fill_ids) < min_required_length:
+        if len(self.full_untruncated_fill_ids) < min_required_length:
             # still incoming stage
             return
 
@@ -54,7 +54,7 @@ class ReqDllmMixin:
             in_prefill = prefix_length < self.seqlen
         else:
             # Masked: the staging block still contains mask tokens to fill.
-            input_block = self.fill_ids[prefix_length:min_required_length]
+            input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
             in_prefill = self.dllm_config.mask_id not in input_block
 
         self.dllm_phase = (
@@ -68,18 +68,18 @@ class ReqDllmMixin:
             # canvases) with no canvas.
             context_len = self.seqlen
             self.dllm_block_offset = context_len
-            if self.fill_ids and len(self.prefix_indices) >= context_len:
+            if self.full_untruncated_fill_ids and len(self.prefix_indices) >= context_len:
                 canvas = array("q", [0] * self.dllm_config.block_size)
-                self.fill_ids = self.origin_input_ids + self.output_ids + canvas
+                self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids + canvas
             else:
-                self.fill_ids = self.origin_input_ids + self.output_ids
+                self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
         else:
             self.dllm_block_offset = (
                 0
-                if not self.fill_ids
+                if not self.full_untruncated_fill_ids
                 else self.dllm_block_offset + self.dllm_config.block_size
             )
-            self.fill_ids = (
+            self.full_untruncated_fill_ids = (
                 self.origin_input_ids
                 + self.output_ids
                 + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)

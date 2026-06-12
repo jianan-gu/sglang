@@ -656,7 +656,7 @@ class PrefillAdder:
         if self.dllm_config.is_uniform:
             # Uniform extends the actual remaining tokens (variable-length encode or
             # the full canvas), not a forced page-aligned block.
-            available = len(req.fill_ids) - prefix_len
+            available = len(req.full_untruncated_fill_ids) - prefix_len
             trunc_len = min(self.rem_dllm_tokens, self.dllm_block_size, available)
         else:
             trunc_len = (
