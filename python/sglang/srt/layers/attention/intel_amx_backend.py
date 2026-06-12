@@ -5,8 +5,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -50,6 +52,14 @@ class IntelAMXAttnBackend(AttentionBackend):
         ).shape[-1]
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
+
+        # Mirror the triton backend: bidirectional (non-causal) extend attention
+        # is only safe when cuda graph is fully disabled and chunked prefill is
+        # off. ENCODER_ONLY / cross-attention layers are always non-causal.
+        self.allow_bidirectional_attention_in_extend = (
+            cuda_graph_fully_disabled()
+            and model_runner.server_args.chunked_prefill_size == -1
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -137,6 +147,19 @@ class IntelAMXAttnBackend(AttentionBackend):
             )
 
         _, max_extend_len = self.forward_metadata
+        is_cross_attn = layer.is_cross_attention or k is None or v is None
+        # Match the triton backend's causal/bidirectional gating so DiffusionGemma
+        # (ENCODER_ONLY / DECODER_BIDIRECTIONAL canvas) attends bidirectionally.
+        causal = True
+        if (
+            is_cross_attn
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+            or (
+                layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
+                and self.allow_bidirectional_attention_in_extend
+            )
+        ):
+            causal = False
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -152,7 +175,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            layer.is_cross_attention or k is None or v is None,
+            is_cross_attn,
+            causal,
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,

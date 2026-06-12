@@ -51,6 +51,7 @@ void extend_attention_kernel_impl(
     int64_t sliding_window_size,
     bool is_prefix_skipped,
     bool is_cross_attn,
+    bool causal,
     bool has_encoder_lens,
     bool has_sink) {
   // strides
@@ -193,8 +194,14 @@ void extend_attention_kernel_impl(
             /* C     */ v_prime);
       }  // loop with seq_len_prefix
       if (!is_cross_attn) {
-        // stage 2: compute the triangle part
-        int num_keys = std::min(seq_len_extend, m + BLOCK_M);
+        // stage 2: compute the extend (self) part.
+        //   - causal:     each query only attends to keys at or before its
+        //                 position, so we cap the key range at m + BLOCK_M and
+        //                 apply a triangle mask.
+        //   - non-causal: bidirectional attention (e.g. DiffusionGemma canvas /
+        //                 ENCODER_ONLY layers), so every query attends to all
+        //                 extend keys and no triangle mask is applied.
+        int num_keys = causal ? std::min(seq_len_extend, m + BLOCK_M) : seq_len_extend;
         for (int n = 0; n < num_keys; n += BLOCK_N) {
           int n_size = std::min(BLOCK_N, num_keys - n);
 
@@ -234,7 +241,7 @@ void extend_attention_kernel_impl(
           //   Query row=0 is at position 512, so keys 513..767 are future and must be
           //   masked — but `num_keys - 0 = 1024 > BLOCK_N` skips masking entirely,
           //   producing wrong (non-causal) attention for rows 0..254 of this m-block.
-          if (n + n_size - 1 > m) {
+          if (causal && n + n_size - 1 > m) {
             for (int row = 0; row < m_size; ++row) {
               int last_col = m + row - n;
               // [Note] mask the entire row if last_col < 0.
@@ -357,6 +364,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         sliding_window_size,                                                               \
         is_prefix_skipped,                                                                 \
         is_cross_attn,                                                                     \
+        causal,                                                                            \
         has_encoder_lens,                                                                  \
         has_sink);                                                                         \
   } while (0)
@@ -393,6 +401,7 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
+    bool causal,
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks) {

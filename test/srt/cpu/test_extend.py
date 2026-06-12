@@ -190,11 +190,14 @@ class TestExtendAttention(CustomTestCase):
         has_sink=False,
         mla=False,
         is_cross_attn=False,
+        causal=None,
         *,
         b_seq_len_prefix=None,
         b_seq_len_extend=None,
     ):
         dtype = torch.bfloat16
+        if causal is None:
+            causal = not is_cross_attn
 
         if b_seq_len_prefix is None:
             b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
@@ -311,7 +314,7 @@ class TestExtendAttention(CustomTestCase):
                 b_seq_len_extend,
                 scaling=sm_scale,
                 enable_gqa=enable_gqa,
-                causal=not is_cross_attn,
+                causal=causal,
                 is_cross_attn=is_cross_attn,
                 encoder_lens=encoder_lens,
             )
@@ -333,6 +336,7 @@ class TestExtendAttention(CustomTestCase):
             sm_scale,
             logit_cap,
             is_cross_attn,
+            causal,
             sliding_window if sliding_window is not None else 0,
             encoder_lens,
             sinks if has_sink else None,
@@ -370,6 +374,26 @@ class TestExtendAttention(CustomTestCase):
                 self._test_extend_attention_once(
                     1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
                 )
+
+    def test_extend_attention_bidirectional(self):
+        # Non-causal (bidirectional) extend attention, e.g. DiffusionGemma canvas
+        # / ENCODER_ONLY layers. Covers with and without prefix context.
+        for b_seq_len_prefix, b_seq_len_extend in (
+            ([0], [64]),
+            ([37], [64]),
+        ):
+            self._test_extend_attention_once(
+                B=1,
+                N_CTX=256,
+                H_Q=16,
+                H_KV=4,
+                D=128,
+                DV=96,
+                is_cross_attn=False,
+                causal=False,
+                b_seq_len_prefix=b_seq_len_prefix,
+                b_seq_len_extend=b_seq_len_extend,
+            )
 
     def test_extend_attention_large_seq_causal_mask(self):
         self._test_extend_attention_once(
