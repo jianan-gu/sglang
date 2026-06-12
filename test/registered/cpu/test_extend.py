@@ -60,6 +60,7 @@ class TestExtendAttention(CustomTestCase):
         enable_gqa=False,
         causal=False,
         is_cross_attn=False,
+        sliding_window=None,
     ):
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
@@ -101,18 +102,49 @@ class TestExtendAttention(CustomTestCase):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out_redudant = (
-                scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
+            if sliding_window is not None and sliding_window > 0:
+                # Build an explicit additive mask so the sliding window can be
+                # combined with (optionally) causal attention. Query position i and
+                # key position j are both absolute within the (redundant) sequence.
+                # The window keeps keys with |i - j| < sliding_window; causal
+                # attention additionally masks future keys (j > i).
+                pos = torch.arange(seq_len_kv, device=per_req_query.device)
+                dist = pos[:, None] - pos[None, :]  # i - j
+                attn_mask = torch.zeros(
+                    (seq_len_kv, seq_len_kv),
+                    dtype=per_req_query.dtype,
+                    device=per_req_query.device,
                 )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
+                outside = dist.abs() >= sliding_window
+                if causal:
+                    outside = outside | (dist < 0)
+                attn_mask.masked_fill_(outside, float("-inf"))
+                per_req_out_redudant = (
+                    scaled_dot_product_attention(
+                        per_req_query_redudant.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        attn_mask=attn_mask,
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=False,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
+            else:
+                per_req_out_redudant = (
+                    scaled_dot_product_attention(
+                        per_req_query_redudant.unsqueeze(0),
+                        per_req_key.unsqueeze(0),
+                        per_req_value.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
             output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
@@ -320,6 +352,7 @@ class TestExtendAttention(CustomTestCase):
                 causal=causal,
                 is_cross_attn=is_cross_attn,
                 encoder_lens=encoder_lens,
+                sliding_window=sliding_window,
             )
 
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
@@ -397,6 +430,31 @@ class TestExtendAttention(CustomTestCase):
                 b_seq_len_prefix=b_seq_len_prefix,
                 b_seq_len_extend=b_seq_len_extend,
             )
+
+    def test_extend_attention_bidirectional_sliding_window(self):
+        # Non-causal (bidirectional) extend attention with a sliding window, e.g.
+        # DiffusionGemma sliding-attention canvas layers. The window must be
+        # symmetric (|query_pos - key_pos| < sliding_window) in both directions,
+        # so future keys beyond the window are masked too. Covers windows smaller
+        # and larger than the extend length, with and without prefix context.
+        for sliding_window in (8, 16, 200):
+            for b_seq_len_prefix, b_seq_len_extend in (
+                ([0], [64]),
+                ([37], [64]),
+            ):
+                self._test_extend_attention_once(
+                    B=1,
+                    N_CTX=256,
+                    H_Q=16,
+                    H_KV=4,
+                    D=128,
+                    DV=96,
+                    sliding_window=sliding_window,
+                    is_cross_attn=False,
+                    causal=False,
+                    b_seq_len_prefix=b_seq_len_prefix,
+                    b_seq_len_extend=b_seq_len_extend,
+                )
 
     def test_extend_attention_large_seq_causal_mask(self):
         self._test_extend_attention_once(
