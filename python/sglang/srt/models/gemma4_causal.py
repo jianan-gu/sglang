@@ -241,7 +241,13 @@ class Gemma4MoE(nn.Module):
             if topk_logits.is_cuda or topk_logits.is_xpu:
                 return gemma_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
 
-            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
+            # Match the CUDA/Triton fused routing (gemma4_fused_ops): compute the
+            # softmax in float32 for numerical parity. topk_logits is the model
+            # dtype (e.g. bf16) on the CPU/fallback path, so a bf16 softmax here
+            # would diverge from the fp32 softmax used on CUDA.
+            topk_weights = torch.nn.functional.softmax(
+                topk_logits.to(torch.float32), dim=-1
+            )
             topk_weights = topk_weights * per_expert_scale[topk_ids].to(
                 topk_weights.dtype
             )
