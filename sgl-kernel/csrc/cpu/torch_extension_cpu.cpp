@@ -451,6 +451,18 @@ void store_cache_cpu(
     const at::Tensor& indices,
     std::optional<int64_t> row_dim);
 
+    // scheduler: paged allocation
+void alloc_extend_kernel_cpu(
+    at::Tensor& pre_lens,
+    at::Tensor& seq_lens,
+    at::Tensor& last_loc,
+    at::Tensor& free_pages,
+    at::Tensor& out_indices,
+    int64_t page_size);
+
+void alloc_decode_kernel_cpu(
+    at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_pages, at::Tensor& out_indices, int64_t page_size);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -462,7 +474,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_tanh_and_mul_cpu", torch::kCPU, &gelu_tanh_and_mul_cpu);
   m.def("gelu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
+  // scheduler: paged allocation
+  m.def(
+      "alloc_extend_kernel_cpu(Tensor pre_lens, Tensor seq_lens, Tensor last_loc, "
+      "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+  m.impl("alloc_extend_kernel_cpu", torch::kCPU, &alloc_extend_kernel_cpu);
 
+  m.def(
+      "alloc_decode_kernel_cpu(Tensor seq_lens, Tensor last_loc, "
+      "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+  m.impl("alloc_decode_kernel_cpu", torch::kCPU, &alloc_decode_kernel_cpu);
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
   m.impl("rmsnorm_cpu", torch::kCPU, &rmsnorm_cpu);
