@@ -106,8 +106,11 @@ class TestExtendAttention(CustomTestCase):
                 # Build an explicit additive mask so the sliding window can be
                 # combined with (optionally) causal attention. Query position i and
                 # key position j are both absolute within the (redundant) sequence.
-                # The window keeps keys with |i - j| < sliding_window; causal
-                # attention additionally masks future keys (j > i).
+                # The window is one-directional, matching the Triton extend kernel
+                # (and torch_native_backend): a key is kept only when it is at most
+                # `sliding_window` positions in the past (i - j < sliding_window).
+                # Future keys (j > i) are never masked by the window itself; causal
+                # attention additionally masks them (j > i).
                 pos = torch.arange(seq_len_kv, device=per_req_query.device)
                 dist = pos[:, None] - pos[None, :]  # i - j
                 attn_mask = torch.zeros(
@@ -115,7 +118,7 @@ class TestExtendAttention(CustomTestCase):
                     dtype=per_req_query.dtype,
                     device=per_req_query.device,
                 )
-                outside = dist.abs() >= sliding_window
+                outside = dist >= sliding_window
                 if causal:
                     outside = outside | (dist < 0)
                 attn_mask.masked_fill_(outside, float("-inf"))
@@ -433,10 +436,12 @@ class TestExtendAttention(CustomTestCase):
 
     def test_extend_attention_bidirectional_sliding_window(self):
         # Non-causal (bidirectional) extend attention with a sliding window, e.g.
-        # DiffusionGemma sliding-attention canvas layers. The window must be
-        # symmetric (|query_pos - key_pos| < sliding_window) in both directions,
-        # so future keys beyond the window are masked too. Covers windows smaller
-        # and larger than the extend length, with and without prefix context.
+        # DiffusionGemma sliding-attention canvas layers. The window is
+        # one-directional, matching the Triton extend kernel: a key is kept only
+        # when it is at most `sliding_window` positions in the past
+        # (query_pos - key_pos < sliding_window). Future keys are not masked by the
+        # window for bidirectional attention. Covers windows smaller and larger
+        # than the extend length, with and without prefix context.
         for sliding_window in (8, 16, 200):
             for b_seq_len_prefix, b_seq_len_extend in (
                 ([0], [64]),
