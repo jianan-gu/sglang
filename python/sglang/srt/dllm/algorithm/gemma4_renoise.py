@@ -10,6 +10,7 @@ schedule + StableAndConfident stopping. Defaults follow the checkpoint's
 generation_config.json and may be overridden via --dllm-algorithm-config.
 """
 
+import os
 from typing import List, Tuple, Union
 
 import torch
@@ -24,6 +25,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+# Opt-in localization for device-side ``index out of bounds`` asserts (XPU/CUDA).
+# These asserts fire asynchronously, so by default the error only surfaces at the
+# next host<->device sync (e.g. a ``.item()`` call), pointing at the wrong line.
+# Set ``SGLANG_DLLM_DEBUG_SYNC=1`` to synchronize after each indexing op and
+# validate canvas token ids eagerly, so the real culprit is reported in place.
+_DLLM_DEBUG_SYNC = os.environ.get("SGLANG_DLLM_DEBUG_SYNC", "0") == "1"
 
 
 class Gemma4Renoise(DllmAlgorithm):
@@ -80,6 +88,35 @@ class Gemma4Renoise(DllmAlgorithm):
             low=0, high=self.vocab_size, size=shape, device=device, generator=gen
         )
 
+    def _sync(self, device) -> None:
+        # Force a host<->device sync so an async device-side assert (e.g. the XPU
+        # ``index out of bounds`` in the embedding gather) is raised at this point
+        # instead of leaking to an unrelated later line. No-op unless debugging.
+        if not _DLLM_DEBUG_SYNC:
+            return
+        mod = getattr(torch, device.type, None)
+        if mod is not None and hasattr(mod, "synchronize"):
+            mod.synchronize()
+
+    def _write_canvas(self, forward_batch, canvas) -> None:
+        # The canvas tokens become ``input_ids`` for the next forward, where they
+        # index ``embed_tokens`` (an ``nn.Embedding`` of ``vocab_size`` rows). A
+        # stray id outside ``[0, vocab_size)`` triggers a device-side out-of-bounds
+        # assert on XPU (and silent garbage reads on CUDA). ``torch.multinomial``
+        # can emit such ids when fed NaN/Inf or all-zero rows, so clamp defensively
+        # before handing the canvas back to the model.
+        ids = canvas.reshape(-1)
+        if _DLLM_DEBUG_SYNC:
+            lo = int(ids.min().item())
+            hi = int(ids.max().item())
+            assert 0 <= lo and hi < self.vocab_size, (
+                f"canvas token id out of range: [{lo}, {hi}] not within "
+                f"[0, {self.vocab_size})"
+            )
+        ids = ids.clamp_(0, self.vocab_size - 1)
+        forward_batch.input_ids[:] = ids
+        self._sync(forward_batch.input_ids.device)
+
     def _accept(self, current, denoiser, token_entropy) -> torch.Tensor:
         # EntropyBound: accept the lowest-entropy positions within entropy_bound.
         # Store the mask so _renoise re-noises exactly its complement.
@@ -130,7 +167,7 @@ class Gemma4Renoise(DllmAlgorithm):
         gen = self._seed_generator(device)
 
         current = self._init_canvas((bs, L), device, gen)
-        forward_batch.input_ids[:] = current.reshape(-1)
+        self._write_canvas(forward_batch, current)
         self_cond = None
         history: List[torch.Tensor] = []
         out = None
@@ -142,12 +179,24 @@ class Gemma4Renoise(DllmAlgorithm):
         for step in reversed(range(1, self.max_denoising_steps + 1)):
             forward_batch.dllm_self_conditioning_logits = self_cond
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            # The embedding gather inside the forward is where a stray canvas id
+            # trips the device-side assert; sync here so it localizes correctly.
+            self._sync(device)
 
             logits = (out.logits_output.full_logits / self._temperature(step)).view(
                 bs, L, -1
             )
             token_entropy = torch.distributions.Categorical(logits=logits).entropy()
             probs = torch.softmax(logits, dim=-1)
+            # ``softcapping``/temperature scaling and masked positions can leave
+            # NaN/Inf in ``logits`` and hence non-finite or all-zero ``probs`` rows.
+            # ``torch.multinomial`` then returns out-of-range ids (observed as an
+            # XPU ``index out of bounds`` assert on the next embedding gather), so
+            # scrub the distribution to a valid one before sampling.
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            invalid = probs.sum(dim=-1, keepdim=True) <= 0
+            if bool(invalid.any()):
+                probs = torch.where(invalid, torch.ones_like(probs), probs)
             denoiser = torch.multinomial(
                 probs.reshape(bs * L, -1), num_samples=1, generator=gen
             ).view(bs, L)
@@ -156,7 +205,7 @@ class Gemma4Renoise(DllmAlgorithm):
             argmax = torch.where(keep, argmax, torch.argmax(logits, dim=-1))
             accepted = self._accept(current, denoiser, token_entropy)
             current = torch.where(keep, current, self._renoise(accepted, gen))
-            forward_batch.input_ids[:] = current.reshape(-1)
+            self._write_canvas(forward_batch, current)
             if self_cond is None:
                 self_cond = logits.reshape(bs * L, -1)
             else:
