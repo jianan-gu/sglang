@@ -98,6 +98,70 @@ class Gemma4Renoise(DllmAlgorithm):
         if mod is not None and hasattr(mod, "synchronize"):
             mod.synchronize()
 
+    @staticmethod
+    def _check_range(name: str, t, low: int, high) -> None:
+        # high is exclusive; ``None`` means "unknown bound, only check low".
+        if t is None or not torch.is_tensor(t) or t.numel() == 0:
+            return
+        if not torch.is_floating_point(t):
+            lo = int(t.min().item())
+            hi = int(t.max().item())
+            bad_low = lo < low
+            bad_high = high is not None and hi >= high
+            assert not (bad_low or bad_high), (
+                f"[dllm-debug] index tensor '{name}' out of range: observed "
+                f"[{lo}, {hi}], expected within [{low}, {high}). This is the "
+                f"tensor that trips the XPU 'index out of bounds' assert."
+            )
+
+    def _check_forward_inputs(self, model_runner, forward_batch) -> None:
+        # Debug-only: validate *every* index tensor the model forward will gather
+        # with, so the opaque async device-side assert is turned into a precise,
+        # localized Python error naming the offending tensor. Defensive: a missing
+        # attribute must never mask the real failure, so each bound lookup is
+        # wrapped and simply skipped when unavailable.
+        if not _DLLM_DEBUG_SYNC:
+            return
+
+        # 1) input_ids -> embed_tokens rows.
+        try:
+            emb = model_runner.model.get_input_embeddings()
+            n_rows = int(emb.weight.shape[0])
+        except Exception:
+            n_rows = self.vocab_size
+        self._check_range("input_ids", forward_batch.input_ids, 0, n_rows)
+
+        # 2) positions -> rotary cos/sin cache (size == max_position_embeddings).
+        try:
+            tc = model_runner.model_config.hf_config.text_config
+            max_pos = int(getattr(tc, "max_position_embeddings", None))
+        except Exception:
+            max_pos = None
+        self._check_range(
+            "positions", getattr(forward_batch, "positions", None), 0, max_pos
+        )
+
+        # 3) out_cache_loc -> token_to_kv_pool slots (note: -1 is an invalid slot).
+        try:
+            kv_size = int(model_runner.token_to_kv_pool_allocator.size)
+        except Exception:
+            kv_size = None
+        self._check_range(
+            "out_cache_loc", getattr(forward_batch, "out_cache_loc", None), 0, kv_size
+        )
+
+        # 4) req_pool_indices -> req_to_token_pool rows.
+        try:
+            n_req = int(model_runner.req_to_token_pool.size)
+        except Exception:
+            n_req = None
+        self._check_range(
+            "req_pool_indices",
+            getattr(forward_batch, "req_pool_indices", None),
+            0,
+            n_req,
+        )
+
     def _write_canvas(self, forward_batch, canvas) -> None:
         # The canvas tokens become ``input_ids`` for the next forward, where they
         # index ``embed_tokens`` (an ``nn.Embedding`` of ``vocab_size`` rows). A
@@ -158,7 +222,11 @@ class Gemma4Renoise(DllmAlgorithm):
             # Skip an empty (fully-cached) encode round, rope can't reshape 0 tokens.
             if forward_batch.input_ids.numel() == 0:
                 return None, [], False
+            # Debug-only: validate the encode pass too — a bad context index here
+            # writes a corrupt KV cache that later trips the decode attention.
+            self._check_forward_inputs(model_runner, forward_batch)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            self._sync(forward_batch.input_ids.device)
             return out.logits_output, [], out.can_run_graph
 
         bs = forward_batch.batch_size
@@ -178,6 +246,9 @@ class Gemma4Renoise(DllmAlgorithm):
 
         for step in reversed(range(1, self.max_denoising_steps + 1)):
             forward_batch.dllm_self_conditioning_logits = self_cond
+            # Debug-only: name the exact out-of-range index tensor before the forward
+            # gathers with it (turns the opaque XPU assert into a precise error).
+            self._check_forward_inputs(model_runner, forward_batch)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             # The embedding gather inside the forward is where a stray canvas id
             # trips the device-side assert; sync here so it localizes correctly.
