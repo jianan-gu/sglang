@@ -162,24 +162,30 @@ class Gemma4Renoise(DllmAlgorithm):
             n_req,
         )
 
-    def _write_canvas(self, forward_batch, canvas) -> None:
-        # The canvas tokens become ``input_ids`` for the next forward, where they
-        # index ``embed_tokens`` (an ``nn.Embedding`` of ``vocab_size`` rows). A
-        # stray id outside ``[0, vocab_size)`` triggers a device-side out-of-bounds
-        # assert on XPU (and silent garbage reads on CUDA). ``torch.multinomial``
-        # can emit such ids when fed NaN/Inf or all-zero rows, so clamp defensively
-        # before handing the canvas back to the model.
-        ids = canvas.reshape(-1)
+    def _sanitize_input_ids(self, forward_batch, source: str) -> None:
+        # Every ``forward_batch.input_ids`` entry indexes ``embed_tokens`` (an
+        # ``nn.Embedding`` of ``vocab_size`` rows). A stray id outside
+        # ``[0, vocab_size)`` triggers a device-side out-of-bounds assert on XPU
+        # (and silent garbage reads on CUDA). This happens both on the decode
+        # canvas (``torch.multinomial`` can emit such ids when fed NaN/Inf or
+        # all-zero rows) and on the encode context (a corrupt context token id),
+        # so clamp defensively before handing the ids back to the model.
+        ids = forward_batch.input_ids
+        if ids is None or ids.numel() == 0:
+            return
         if _DLLM_DEBUG_SYNC:
             lo = int(ids.min().item())
             hi = int(ids.max().item())
             assert 0 <= lo and hi < self.vocab_size, (
-                f"canvas token id out of range: [{lo}, {hi}] not within "
+                f"{source} token id out of range: [{lo}, {hi}] not within "
                 f"[0, {self.vocab_size})"
             )
-        ids = ids.clamp_(0, self.vocab_size - 1)
-        forward_batch.input_ids[:] = ids
-        self._sync(forward_batch.input_ids.device)
+        ids.clamp_(0, self.vocab_size - 1)
+        self._sync(ids.device)
+
+    def _write_canvas(self, forward_batch, canvas) -> None:
+        forward_batch.input_ids[:] = canvas.reshape(-1)
+        self._sanitize_input_ids(forward_batch, "canvas")
 
     def _accept(self, current, denoiser, token_entropy) -> torch.Tensor:
         # EntropyBound: accept the lowest-entropy positions within entropy_bound.
@@ -225,6 +231,9 @@ class Gemma4Renoise(DllmAlgorithm):
             # Debug-only: validate the encode pass too — a bad context index here
             # writes a corrupt KV cache that later trips the decode attention.
             self._check_forward_inputs(model_runner, forward_batch)
+            # Defensively clamp context ids into ``[0, vocab_size)`` so a corrupt
+            # token can't trip the device-side embedding out-of-bounds assert.
+            self._sanitize_input_ids(forward_batch, "context")
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             self._sync(forward_batch.input_ids.device)
             return out.logits_output, [], out.can_run_graph
