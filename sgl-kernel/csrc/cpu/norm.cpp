@@ -519,7 +519,12 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   // weight may either share the input dtype or be float32.
   const auto wt = weight.scalar_type();
   TORCH_CHECK(
-      wt == st || wt == at::kFloat, "rmsnorm_cpu: weight dtype must match input dtype or be float32.");
+      wt == st || wt == at::kFloat,
+      "rmsnorm_cpu: weight dtype must match input dtype or be float32, got input dtype ",
+      st,
+      " and weight dtype ",
+      wt,
+      ".");
   CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, wt);
 
   NormParams p{input, static_cast<float>(eps)};
