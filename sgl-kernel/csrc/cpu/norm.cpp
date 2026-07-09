@@ -21,6 +21,10 @@ struct NormParams {
   const void* weight{nullptr};
   const void* bias{nullptr};
 
+  // When true, `weight` points to float32 data even if the input/output tensors
+  // use a reduced floating-point type (bfloat16/float16).
+  bool weight_is_float{false};
+
   explicit NormParams(const at::Tensor& input, float eps_) : ndim(input.dim()), eps(eps_) {
     TORCH_CHECK(ndim >= 2 && ndim <= 4, "Expected a 2D/3D/4D tensor, got ", ndim, "D.");
 
@@ -205,10 +209,17 @@ struct NormReduce<M, at::BFloat16, D> {
       va1 = _mm512_mul_ps(va1, vrscale);
       if constexpr (NormTraits<M>::has_weight) {
         // TODO: need to block B to hide weight reload
-        const at::BFloat16* weight = static_cast<const at::BFloat16*>(params.weight);
-        __m512i w16 = (__m512i)(_mm512_loadu_si512(weight + col * 32));
-        __m512 w0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w16, 0));
-        __m512 w1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w16, 1));
+        __m512 w0, w1;
+        if (params.weight_is_float) {
+          const float* weight = static_cast<const float*>(params.weight);
+          w0 = _mm512_loadu_ps(weight + col * 32);
+          w1 = _mm512_loadu_ps(weight + col * 32 + 16);
+        } else {
+          const at::BFloat16* weight = static_cast<const at::BFloat16*>(params.weight);
+          __m512i w16 = (__m512i)(_mm512_loadu_si512(weight + col * 32));
+          w0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w16, 0));
+          w1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w16, 1));
+        }
         if constexpr (NormTraits<M>::has_shift) {
           w0 = NormTraits<M>::apply_shift(w0, vshift);
           w1 = NormTraits<M>::apply_shift(w1, vshift);
@@ -314,7 +325,12 @@ struct NormReduceGeneric {
       x_fvec0 = x_fvec0 * scale_fvec;
       x_fvec1 = x_fvec1 * scale_fvec;
       if constexpr (NormTraits<M>::has_weight) {
-        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.weight) + d);
+        fVec w_fvec0, w_fvec1;
+        if (params.weight_is_float) {
+          std::tie(w_fvec0, w_fvec1) = load_float_vec2(static_cast<const float*>(params.weight) + d);
+        } else {
+          std::tie(w_fvec0, w_fvec1) = load_float_vec2(static_cast<const scalar_t*>(params.weight) + d);
+        }
         if constexpr (NormTraits<M>::has_shift) {
           w_fvec0 = NormTraits<M>::apply_shift(w_fvec0, shift_fvec);
           w_fvec1 = NormTraits<M>::apply_shift(w_fvec1, shift_fvec);
@@ -349,7 +365,9 @@ struct NormReduceGeneric {
       }
       x_val *= rsqrt_var;
       if constexpr (NormTraits<M>::has_weight) {
-        float w_val = static_cast<float>(static_cast<const scalar_t*>(params.weight)[d]);
+        float w_val = params.weight_is_float
+            ? static_cast<const float*>(params.weight)[d]
+            : static_cast<float>(static_cast<const scalar_t*>(params.weight)[d]);
         if constexpr (NormTraits<M>::has_shift) {
           w_val = NormTraits<M>::apply_shift(w_val, params.shift);
         }
@@ -498,10 +516,15 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   const auto st = input.scalar_type();
   CHECK_INPUT_ND<2, 3>(input);
-  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, st);
+  // weight may either share the input dtype or be float32.
+  const auto wt = weight.scalar_type();
+  TORCH_CHECK(
+      wt == st || wt == at::kFloat, "rmsnorm_cpu: weight dtype must match input dtype or be float32.");
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, wt);
 
   NormParams p{input, static_cast<float>(eps)};
   p.weight = weight.data_ptr();
+  p.weight_is_float = (wt == at::kFloat);
 
   at::Tensor output = at::empty_like(input);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "rmsnorm_kernel", [&] {
