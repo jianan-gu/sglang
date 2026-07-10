@@ -155,6 +155,19 @@ struct NormTraits<NormMode::RMSNormGated> : NormTraitsBase {
 template <NormMode M, typename scalar_t, int D>
 struct NormReduce;
 
+// Store two float vectors into `out`. For float32 output the vectors are stored
+// directly; for reduced-precision output they are packed via convert_from_float_ext.
+template <typename scalar_t>
+inline void store_float_vec2(
+    scalar_t* __restrict__ out, const at::vec::Vectorized<float>& x0, const at::vec::Vectorized<float>& x1) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    x0.store(out);
+    x1.store(out + at::vec::Vectorized<float>::size());
+  } else {
+    convert_from_float_ext<scalar_t>(x0, x1).store(out);
+  }
+}
+
 #if defined(CPU_CAPABILITY_AVX512)
 template <NormMode M, int D>
 struct NormReduce<M, at::BFloat16, D> {
@@ -259,7 +272,6 @@ struct NormReduceGeneric {
       scalar_t* __restrict__ residual,
       const NormParams& params,
       int D) {
-    using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
     // Each iteration loads two float vectors via load_float_vec2, which handles
     // both reduced-precision inputs (one bVec -> two fVec) and float32 inputs
@@ -319,12 +331,7 @@ struct NormReduceGeneric {
         auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
         x_fvec0 += r_fvec0;
         x_fvec1 += r_fvec1;
-        if constexpr (std::is_same_v<scalar_t, float>) {
-          x_fvec0.store(residual + d);
-          x_fvec1.store(residual + d + fVec::size());
-        } else {
-          convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual + d);
-        }
+        store_float_vec2<scalar_t>(residual + d, x_fvec0, x_fvec1);
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_fvec0 = x_fvec0 - mean_fvec;
@@ -358,13 +365,7 @@ struct NormReduceGeneric {
         x_fvec0 = NormTraits<M>::apply_gate(x_fvec0, g_fvec0);
         x_fvec1 = NormTraits<M>::apply_gate(x_fvec1, g_fvec1);
       }
-      if constexpr (std::is_same_v<scalar_t, float>) {
-        x_fvec0.store(out + d);
-        x_fvec1.store(out + d + fVec::size());
-      } else {
-        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        out_bvec.store(out + d);
-      }
+      store_float_vec2<scalar_t>(out + d, x_fvec0, x_fvec1);
     }
 #pragma GCC unroll 4
     for (; d < D; ++d) {
