@@ -261,7 +261,10 @@ struct NormReduceGeneric {
       int D) {
     using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
-    constexpr int kVecSize = bVec::size();
+    // Each iteration loads two float vectors via load_float_vec2, which handles
+    // both reduced-precision inputs (one bVec -> two fVec) and float32 inputs
+    // (two consecutive fVec). Use a step of 2 * fVec::size() so it works for both.
+    constexpr int kVecSize = 2 * static_cast<int>(fVec::size());
 
     const bool use_bias = params.bias != nullptr;
     fVec sum_fvec{0.f}, sum2_fvec{0.f};
@@ -316,7 +319,12 @@ struct NormReduceGeneric {
         auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
         x_fvec0 += r_fvec0;
         x_fvec1 += r_fvec1;
-        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual + d);
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          x_fvec0.store(residual + d);
+          x_fvec1.store(residual + d + fVec::size());
+        } else {
+          convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual + d);
+        }
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_fvec0 = x_fvec0 - mean_fvec;
@@ -350,8 +358,13 @@ struct NormReduceGeneric {
         x_fvec0 = NormTraits<M>::apply_gate(x_fvec0, g_fvec0);
         x_fvec1 = NormTraits<M>::apply_gate(x_fvec1, g_fvec1);
       }
-      bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-      out_bvec.store(out + d);
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        x_fvec0.store(out + d);
+        x_fvec1.store(out + d + fVec::size());
+      } else {
+        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        out_bvec.store(out + d);
+      }
     }
 #pragma GCC unroll 4
     for (; d < D; ++d) {
@@ -516,6 +529,7 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   const auto st = input.scalar_type();
   CHECK_INPUT_ND<2, 3>(input);
+  // input may be a reduced floating-point type (bfloat16/float16) or float32.
   // weight may either share the input dtype or be float32.
   const auto wt = weight.scalar_type();
   TORCH_CHECK(
@@ -532,7 +546,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   p.weight_is_float = (wt == at::kFloat);
 
   at::Tensor output = at::empty_like(input);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "rmsnorm_kernel", [&] {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::ScalarType::Float, st, "rmsnorm_kernel", [&] {
     norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
   });
   return output;
