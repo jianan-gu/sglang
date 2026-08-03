@@ -376,9 +376,13 @@ class MiniMaxH3DenoisingStage(PipelineStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.xpu.is_available():
+            device = torch.device("xpu")
+        else:
+            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or XPU")
         model = _resolve_denoise_model(self.transformer, device)
 
         _assemble_condition_rows(ctx)

@@ -4,9 +4,10 @@
 Implements the tensor-encoding recipe:
 
 - plain bf16 ``from_pretrained()`` (no device_map), then retain only the
-  layers needed for layer-50 output
-- cuDNN SDP is enabled during encode via
-  ``torch.backends.cuda.enable_cudnn_sdp(True)``
+    layers needed for layer-50 output; ``MINIMAX_H3_ENCODER_DEVICE`` selects
+    CPU residency or the TP=8 Transformers tensor-parallel path
+- cuDNN SDP is enabled during CUDA encode via
+    ``torch.backends.cuda.enable_cudnn_sdp(True)``
 - forward the multimodal backbone with all-ones attention_mask and
   mm_token_type_ids derived from ``config.image_token_id`` (position_ids
   omitted: model computes rope internally)
@@ -16,28 +17,122 @@ Implements the tensor-encoding recipe:
 
 The encoder is pure-tensor (presentation building lives in
 ``pipelines_core/.../minimax_h3/presentation.py``). Supports persistent CPU
-offload for single-GPU residency (offload after use, never free).
+offload for single-GPU residency and recoverable destroy/reload offload for
+Transformers TP residency.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.distributed.sp_broadcast import minimax_h3_sp_ctx
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
+MINIMAX_H3_QWEN3VL_TRANSFORMERS_TP_SIZE = 8
+MINIMAX_H3_ENCODER_DEVICE_ENV = "MINIMAX_H3_ENCODER_DEVICE"
+MINIMAX_H3_ENCODER_TP_OFFLOAD_ENV = "MINIMAX_H3_ENCODER_TP_OFFLOAD"
+MINIMAX_H3_QWEN3VL_TEXT_TP_PLAN = {
+    "model.language_model.layers.*.self_attn.q_proj": "colwise",
+    "model.language_model.layers.*.self_attn.k_proj": "colwise",
+    "model.language_model.layers.*.self_attn.v_proj": "colwise",
+    "model.language_model.layers.*.self_attn.o_proj": "rowwise",
+    "model.language_model.layers.*.mlp.gate_proj": "colwise",
+    "model.language_model.layers.*.mlp.up_proj": "colwise",
+    "model.language_model.layers.*.mlp.down_proj": "rowwise",
+}
+MINIMAX_H3_QWEN3VL_VISION_TP_PLAN = {
+    # qkv fused: gather output so existing reshape(seq, 3, num_heads, -1) still works
+    "model.visual.blocks.*.attn.qkv": "colwise_gather_output",
+    "model.visual.blocks.*.attn.proj": "rowwise_split_input",
 
+    # vision MLP standard TP
+    "model.visual.blocks.*.mlp.linear_fc1": "colwise",
+    "model.visual.blocks.*.mlp.linear_fc2": "rowwise",
+
+    # final merger / deepstack mergers
+    "model.visual.merger.linear_fc1": "colwise",
+    "model.visual.merger.linear_fc2": "rowwise",
+    "model.visual.deepstack_merger_list.*.linear_fc1": "colwise",
+    "model.visual.deepstack_merger_list.*.linear_fc2": "rowwise",
+}
 logger = init_logger(__name__)
+MINIMAX_H3_QWEN3VL_TP_PLAN = {
+    **MINIMAX_H3_QWEN3VL_TEXT_TP_PLAN,
+    **MINIMAX_H3_QWEN3VL_VISION_TP_PLAN,
+}
 
 
-def _enable_cudnn_sdp() -> None:
-    # Encoding runs with cuDNN SDP enabled.
-    torch.backends.cuda.enable_cudnn_sdp(True)
+def _enable_cudnn_sdp(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.backends.cuda.enable_cudnn_sdp(True)
+
+
+def _tp_world_size() -> int:
+    if not model_parallel_is_initialized():
+        return 1
+    return get_tp_world_size()
+
+
+def _resolve_encoder_device_mode(*, sp_world: int, tp_world: int) -> bool:
+    mode = os.getenv(MINIMAX_H3_ENCODER_DEVICE_ENV, "auto").strip().lower()
+    if mode in ("", "auto"):
+        return sp_world == 1 and tp_world == MINIMAX_H3_QWEN3VL_TRANSFORMERS_TP_SIZE
+    if mode == "cpu":
+        return False
+    if mode in ("transformers_tp", "tp", "xpu_tp"):
+        if sp_world != 1 or tp_world != MINIMAX_H3_QWEN3VL_TRANSFORMERS_TP_SIZE:
+            raise ValueError(
+                f"{MINIMAX_H3_ENCODER_DEVICE_ENV}={mode!r} requires SP=1 and "
+                f"TP={MINIMAX_H3_QWEN3VL_TRANSFORMERS_TP_SIZE}, got "
+                f"SP={sp_world}, TP={tp_world}."
+            )
+        return True
+    raise ValueError(
+        f"Unsupported {MINIMAX_H3_ENCODER_DEVICE_ENV}={mode!r}. Expected one "
+        "of: auto, cpu, transformers_tp."
+    )
+
+
+def _rank_local_encoder_tp_device() -> torch.device:
+    device = get_local_torch_device()
+    if device.type == "cpu":
+        raise RuntimeError(
+            f"{MINIMAX_H3_ENCODER_DEVICE_ENV}=transformers_tp requires a rank-local "
+            "accelerator device, but get_local_torch_device() returned cpu. "
+            "Check that XPU is visible in this process and that "
+            "SGLANG_DIFFUSION_PLATFORM_OVERRIDE is not set to cpu."
+        )
+    return device
+
+
+def _should_destroy_tp_encoder_on_offload() -> bool:
+    mode = os.getenv(MINIMAX_H3_ENCODER_TP_OFFLOAD_ENV, "destroy").strip().lower()
+    if mode in ("", "destroy", "release", "reload", "true", "1", "yes"):
+        return True
+    if mode in ("keep", "none", "false", "0", "no"):
+        return False
+    raise ValueError(
+        f"Unsupported {MINIMAX_H3_ENCODER_TP_OFFLOAD_ENV}={mode!r}. Expected "
+        "one of: destroy, keep."
+    )
+
+
+def _empty_device_cache(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
 
 
 def _retain_selected_lm_layer(model: torch.nn.Module, selected_layer: int) -> None:
@@ -99,20 +194,61 @@ class MiniMaxH3Qwen3VLHFEncoder:
         self,
         *,
         hf_model_path: str,
-        device: str = "cuda",
+        device: str = "cpu",
+        use_transformers_tp: bool = False,
+        tp_size: int = 1,
     ) -> None:
-        from transformers import Qwen3VLForConditionalGeneration
-
         self.selected_lm_layer = MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER
         self.hidden_dim = MINIMAX_H3_QWEN3VL_HIDDEN_DIM
         self.hf_model_path = hf_model_path
-        self.device = torch.device(device)
-        # Residency contract: weights live on CPU between uses; the
-        # stage calls load_to_device() before encode_ids() and
-        # offload_to_cpu() afterwards. Constructed on CPU so pipeline init
-        # never co-resides the 64G encoder with the 62G DiT on one GPU.
+        self.use_transformers_tp = use_transformers_tp
+        self.tp_size = tp_size
+        self.destroy_tp_encoder_on_offload = (
+            use_transformers_tp and _should_destroy_tp_encoder_on_offload()
+        )
+        self.device = (
+            _rank_local_encoder_tp_device()
+            if use_transformers_tp
+            else torch.device(device)
+        )
+        logger.info(
+            "MiniMax H3 Qwen3VL encoder initialized on %s (TP=%d)",
+            self.device,
+            tp_size,
+        )
+        self.model: torch.nn.Module | None = None
+        self.image_token_id: int | None = None
+        self.video_token_id: int | None = None
+        self._load_model()
+
+    def _load_model(self) -> None:
+        if self.model is not None:
+            return
+        from transformers import Qwen3VLForConditionalGeneration
+
+        load_kwargs: dict[str, Any] = {
+            "dtype": torch.bfloat16,
+            "trust_remote_code": False,
+        }
+        if self.use_transformers_tp:
+            load_kwargs.update(
+                {
+                    "tp_plan": MINIMAX_H3_QWEN3VL_TP_PLAN,
+                    "tp_size": self.tp_size,
+                }
+            )
+            logger.info(
+                "Loading MiniMax H3 Qwen3VL encoder with Transformers TP=%d on %s",
+                self.tp_size,
+                self.device,
+            )
+        else:
+            logger.info(
+                "Loading MiniMax H3 Qwen3VL encoder on CPU; enable TP=8/SP=1 "
+                "to use the Transformers TP path."
+            )
         causal_lm = Qwen3VLForConditionalGeneration.from_pretrained(
-            hf_model_path, dtype=torch.bfloat16, trust_remote_code=False
+            self.hf_model_path, **load_kwargs
         ).eval()
         self.image_token_id = int(causal_lm.config.image_token_id)
         self.video_token_id = int(causal_lm.config.video_token_id)
@@ -122,6 +258,11 @@ class MiniMaxH3Qwen3VLHFEncoder:
         self.model = causal_lm.model
         _retain_selected_lm_layer(self.model, self.selected_lm_layer)
         del causal_lm
+
+    def _require_model(self) -> torch.nn.Module:
+        if self.model is None:
+            raise RuntimeError("encoder is released; call load_to_device() before use")
+        return self.model
 
     @classmethod
     def load_component(
@@ -155,7 +296,16 @@ class MiniMaxH3Qwen3VLHFEncoder:
                 sp_rank,
             )
             return MiniMaxH3Qwen3VLHFEncoderStub(hf_model_path=component_model_path)
-        return cls(hf_model_path=component_model_path)
+        tp_world = _tp_world_size()
+        use_transformers_tp = _resolve_encoder_device_mode(
+            sp_world=sp_world,
+            tp_world=tp_world,
+        )
+        return cls(
+            hf_model_path=component_model_path,
+            use_transformers_tp=use_transformers_tp,
+            tp_size=tp_world,
+        )
 
     @torch.inference_mode()
     def encode_ids(
@@ -182,11 +332,15 @@ class MiniMaxH3Qwen3VLHFEncoder:
             raise ValueError(
                 "pixel_values_videos and video_grid_thw must be given together"
             )
-        if next(self.model.parameters()).device.type != self.device.type:
+        if (
+            not self.use_transformers_tp
+            and next(self._require_model().parameters()).device.type != self.device.type
+        ):
             raise RuntimeError(
                 "encoder is offloaded; call load_to_device() before encode_ids()"
             )
-        _enable_cudnn_sdp()
+        model = self._require_model()
+        _enable_cudnn_sdp(self.device)
         ids = input_ids.to(self.device, torch.long)[None]
         kwargs: dict = {
             "input_ids": ids,
@@ -212,7 +366,7 @@ class MiniMaxH3Qwen3VLHFEncoder:
                 self.device, torch.bfloat16
             )
             kwargs["video_grid_thw"] = video_grid_thw.to(self.device, torch.long)
-        outputs = self.model(**kwargs)
+        outputs = model(**kwargs)
         hidden = outputs.last_hidden_state[0].to(torch.bfloat16)
         if list(hidden.shape) != [int(ids.shape[1]), self.hidden_dim]:
             raise ValueError(
@@ -222,12 +376,33 @@ class MiniMaxH3Qwen3VLHFEncoder:
         return hidden.cpu()
 
     def offload_to_cpu(self) -> None:
-        """Move weights to CPU (persistent residency; never freed)."""
-        self.model.to("cpu")
-        torch.cuda.empty_cache()
+        """Release accelerator-resident weights after an encode pass.
+
+        Non-TP mode keeps the original persistent CPU residency. Transformers
+        TP creates rank-local sharded state that is not reliably CPU-movable, so
+        the memory-mode path releases it by deleting the module; load_to_device()
+        restores it from the checkpoint for the next request.
+        """
+        if self.use_transformers_tp:
+            if self.destroy_tp_encoder_on_offload and self.model is not None:
+                logger.info(
+                    "Releasing MiniMax H3 Qwen3VL TP encoder on %s; it will be "
+                    "reloaded on the next text-encoding use",
+                    self.device,
+                )
+                del self.model
+                self.model = None
+                gc.collect()
+                _empty_device_cache(self.device)
+            return
+        self._require_model().to("cpu")
+        _empty_device_cache(self.device)
 
     def load_to_device(self) -> None:
-        self.model.to(self.device)
+        if self.use_transformers_tp:
+            self._load_model()
+            return
+        self._require_model().to(self.device)
 
 
 EntryClass = MiniMaxH3Qwen3VLHFEncoder

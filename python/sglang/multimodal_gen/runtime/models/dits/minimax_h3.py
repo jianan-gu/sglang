@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -296,6 +297,55 @@ def _sdpa_varlen_attention(
     return out
 
 
+def _flash_attn_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    cu_seqlens = cu_seqlens.contiguous()
+    if q.device.type == "xpu":
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=False,
+        )
+    else:
+        from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            flash_attn as _fa_backend,
+        )
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=False,
+            ver=_fa_backend.fa_ver,
+        )
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
+
+
 class MiniMaxH3Attention(nn.Module):
     def __init__(
         self,
@@ -303,15 +353,17 @@ class MiniMaxH3Attention(nn.Module):
         quant_config: QuantizationConfig | None,
     ) -> None:
         super().__init__()
-        self.num_heads = arch.num_attention_heads
+        tp_size = get_tp_world_size()
+        self.total_num_heads = arch.num_attention_heads
+        self.num_heads = arch.num_attention_heads // tp_size
         self.head_dim = arch.attention_head_dim
-        inner_dim = self.num_heads * self.head_dim
+        inner_dim = self.total_num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self._supported_attention_backends = arch._supported_attention_backends
         self._attention_backend: AttentionBackendEnum | None = None
-        self.qkv_proj = ColumnParallelLinear(
+        self.qkv_proj = MergedColumnParallelLinear(
             arch.hidden_size,
-            inner_dim * 3,
+            [inner_dim, inner_dim, inner_dim],
             bias=False,
             gather_output=False,
             params_dtype=_BF16_DTYPE,
@@ -369,7 +421,8 @@ class MiniMaxH3Attention(nn.Module):
         """
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split(self.num_heads * self.head_dim, dim=-1)
+        local_inner_dim = self.num_heads * self.head_dim
+        q, k, v = qkv.split(local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
@@ -381,6 +434,11 @@ class MiniMaxH3Attention(nn.Module):
 
         sp_active = sp_seq_lens is not None and len(sp_seq_lens) > 1
         if sp_active:
+            if get_tp_world_size() > 1:
+                raise ValueError(
+                    "MiniMaxH3DiTModel TP currently supports SP=1 only; "
+                    "disable Ulysses/SP when enabling TP."
+                )
             from sglang.multimodal_gen.runtime.layers.usp import (
                 _usp_input_all_to_all_varlen,
                 _usp_output_all_to_all_varlen,
@@ -389,11 +447,6 @@ class MiniMaxH3Attention(nn.Module):
             q = _usp_input_all_to_all_varlen(q[None], sp_seq_lens, head_dim=2)[0]
             k = _usp_input_all_to_all_varlen(k[None], sp_seq_lens, head_dim=2)[0]
             v = _usp_input_all_to_all_varlen(v[None], sp_seq_lens, head_dim=2)[0]
-
-        from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-        from sglang.multimodal_gen.runtime.layers.attention.backends import (
-            flash_attn as _fa_backend,
-        )
 
         if self._attention_backend is None:
             # Resolve through the shared selector once per module: the
@@ -411,20 +464,9 @@ class MiniMaxH3Attention(nn.Module):
             ).get_enum()
 
         if self._attention_backend is AttentionBackendEnum.FA:
-            out = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                softmax_scale=self.softmax_scale,
-                causal=False,
-                ver=_fa_backend.fa_ver,
+            out = _flash_attn_varlen_attention(
+                q, k, v, cu_seqlens, max_seqlen, self.softmax_scale
             )
-            if isinstance(out, tuple):
-                out = out[0]
         else:
             # Generic-layer semantics: SDPA is the correctness fallback for
             # platforms where FA is unavailable.
@@ -433,7 +475,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         if sp_active:
             out = _usp_output_all_to_all_varlen(out[None], sp_seq_lens, head_dim=2)[0]
-        out = out.reshape(total, self.num_heads * self.head_dim)
+        out = out.reshape(total, local_inner_dim)
         out, _ = self.out_proj(out)
         return out
 
@@ -445,9 +487,9 @@ class MiniMaxH3MLP(nn.Module):
         quant_config: QuantizationConfig | None,
     ) -> None:
         super().__init__()
-        self.fc1 = ColumnParallelLinear(
+        self.fc1 = MergedColumnParallelLinear(
             arch.hidden_size,
-            arch.ffn_hidden_size * 2,
+            [arch.ffn_hidden_size, arch.ffn_hidden_size],
             bias=False,
             gather_output=False,
             params_dtype=_BF16_DTYPE,
@@ -719,10 +761,10 @@ class MiniMaxH3DiTModel(CachableDiT):
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
-        if tp_size != 1:
+        if tp_size not in (1, 8):
             raise ValueError(
-                "MiniMaxH3DiTModel supports TP=1 only. Packed qkv/fc1 TP "
-                "requires per-logical-matrix sharding before enabling TP>1."
+                "MiniMaxH3DiTModel currently supports TP=1 or the targeted "
+                f"TP=8 path only, got TP={tp_size}."
             )
         if arch.num_attention_heads <= 0:
             raise ValueError("num_attention_heads must be positive.")
@@ -732,6 +774,16 @@ class MiniMaxH3DiTModel(CachableDiT):
             raise ValueError("attention_head_dim must be positive.")
         if arch.ffn_hidden_size <= 0:
             raise ValueError("ffn_hidden_size must be positive.")
+        if arch.num_attention_heads % tp_size:
+            raise ValueError(
+                "MiniMaxH3DiTModel TP requires num_attention_heads divisible by "
+                f"tp_size, got {arch.num_attention_heads} and {tp_size}."
+            )
+        if arch.ffn_hidden_size % tp_size:
+            raise ValueError(
+                "MiniMaxH3DiTModel TP requires ffn_hidden_size divisible by "
+                f"tp_size, got {arch.ffn_hidden_size} and {tp_size}."
+            )
 
     def __init__(
         self,
