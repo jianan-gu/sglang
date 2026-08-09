@@ -252,8 +252,8 @@ def register_fake_ops(tp_size: int):
             return torch.empty_like(query), torch.empty_like(key)
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
-    def _(query, key, cos, sin):
-        return query, key
+    def _(query, key, cos, sin, unsqueeze_dim=1):
+        return torch.empty_like(query), torch.empty_like(key)
 
     @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
     def _(
