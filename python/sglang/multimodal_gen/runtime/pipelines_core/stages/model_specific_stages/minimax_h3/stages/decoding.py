@@ -64,8 +64,8 @@ def _cached_decode_mean_std(
     reconstructs an identical tensor; cache it instead of rebuilding it on
     every decode call.
     """
-    mean = torch.as_tensor(mean_values, device=device, dtype=dtype)
-    std = torch.as_tensor(std_values, device=device, dtype=dtype)
+    mean = torch.as_tensor(mean_values, dtype=dtype).to(device=device)
+    std = torch.as_tensor(std_values, dtype=dtype).to(device=device)
     return mean, std
 
 
@@ -76,6 +76,24 @@ def _reverse_normalize_latents_(
     std_values,
     name: str,
 ) -> torch.Tensor:
+    if latents.ndim < 2:
+        raise ValueError(f"{name} latents must have a channel dimension")
+    if len(mean_values) != len(std_values):
+        raise ValueError(
+            f"{name} latent normalization shape mismatch: "
+            f"mean_len={len(mean_values)} std_len={len(std_values)}"
+        )
+    if int(latents.shape[1]) != len(mean_values):
+        raise ValueError(
+            f"{name} latent normalization channel mismatch: "
+            f"latents.shape[1]={int(latents.shape[1])} mean_len={len(mean_values)}"
+        )
+    if latents.device.type == "xpu":
+        for channel_index, (mean_value, std_value) in enumerate(
+            zip(mean_values, std_values, strict=True)
+        ):
+            latents[:, channel_index].mul_(float(std_value)).add_(float(mean_value))
+        return latents
     mean, std = _cached_decode_mean_std(
         tuple(mean_values), tuple(std_values), latents.device, latents.dtype
     )
@@ -87,13 +105,6 @@ def _reverse_normalize_latents_(
         raise ValueError(
             f"{name} latent normalization shape mismatch: "
             f"mean={tuple(mean.shape)} std={tuple(std.shape)}"
-        )
-    if latents.ndim < 2:
-        raise ValueError(f"{name} latents must have a channel dimension")
-    if int(latents.shape[1]) != int(mean.shape[0]):
-        raise ValueError(
-            f"{name} latent normalization channel mismatch: "
-            f"latents.shape[1]={int(latents.shape[1])} mean_len={int(mean.shape[0])}"
         )
     view_shape = [1] * latents.ndim
     view_shape[1] = int(mean.shape[0])
@@ -224,6 +235,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self._compiled_audio_vae_decode = ActiveTargetCompiledCallable()
+        self._decode_stats_preheated = False
 
     @property
     def role_affinity(self) -> RoleType:
@@ -250,6 +262,27 @@ class MiniMaxH3DecodingStage(DecodingStage):
         ]
         uses.append(ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype))
         return uses
+
+    def _preheat_decode_stats(self, server_args: ServerArgs) -> None:
+        if self._decode_stats_preheated:
+            return
+        visual_arch_config = server_args.pipeline_config.vae_config.arch_config
+        audio_arch_config = server_args.pipeline_config.audio_vae_config.arch_config
+        _cached_decode_mean_std(
+            tuple(visual_arch_config.latents_mean),
+            tuple(visual_arch_config.latents_std),
+            torch.device("cpu"),
+            resolve_decode_precision(server_args, "video_vae"),
+        )
+        _cached_decode_mean_std(
+            tuple(audio_arch_config.latents_mean),
+            tuple(audio_arch_config.latents_std),
+            torch.device("cpu"),
+            resolve_precision(
+                server_args, "audio_vae", precision_attr="audio_vae_precision"
+            ),
+        )
+        self._decode_stats_preheated = True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -318,6 +351,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         _minimax_h3_decoder_task(batch)
+        self._preheat_decode_stats(server_args)
         visual_latent = _required_tensor(batch.latents, "batch.latents")
         audio_latent = _required_tensor(batch.audio_latents, "batch.audio_latents")
         if visual_latent.ndim != 5:
