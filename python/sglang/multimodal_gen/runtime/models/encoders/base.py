@@ -156,6 +156,7 @@ class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
     layerwise_offload_dit_group_enabled = False
+    layerwise_offload_pin_cpu_memory = False
     layer_names = [
         "layers",
         "encoder.block",

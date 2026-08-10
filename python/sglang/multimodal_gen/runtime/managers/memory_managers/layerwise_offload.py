@@ -611,6 +611,7 @@ class LayerwiseOffloadableModuleMixin:
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
+    layerwise_offload_pin_cpu_memory: bool = True
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
@@ -651,7 +652,9 @@ class LayerwiseOffloadableModuleMixin:
                 layers_attr_str=layer_name,
                 num_layers=num_layers,
                 enabled=True,
-                pin_cpu_memory=server_args.pin_cpu_memory,
+                pin_cpu_memory=(
+                    server_args.pin_cpu_memory and self.layerwise_offload_pin_cpu_memory
+                ),
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
             )
