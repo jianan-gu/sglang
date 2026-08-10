@@ -473,7 +473,8 @@ def _can_use_xpu_fused_qknorm_rope(head_dim: int, rope_dim: int) -> bool:
     elems_per_thread = head_dim // 32
     if elems_per_thread <= 0 or rope_dim % elems_per_thread != 0:
         return False
-    return rope_dim // elems_per_thread >= 2
+    rotary_lane_count = rope_dim // elems_per_thread
+    return rotary_lane_count >= 2 and rotary_lane_count & (rotary_lane_count - 1) == 0
 
 
 class MiniMaxH3TimeEmbedder(nn.Module):
