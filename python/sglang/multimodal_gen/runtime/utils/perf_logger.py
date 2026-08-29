@@ -228,7 +228,6 @@ class StageProfiler:
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and self._should_record_as_step()
                 and torch.get_device_module().is_available()
             ):
                 torch.get_device_module().synchronize()
@@ -242,7 +241,6 @@ class StageProfiler:
 
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and self._should_record_as_step()
             and torch.get_device_module().is_available()
         ):
             torch.get_device_module().synchronize()

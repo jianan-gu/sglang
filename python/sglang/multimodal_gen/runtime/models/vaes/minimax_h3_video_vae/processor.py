@@ -260,6 +260,8 @@ class VAEProcessor:
             tensor = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor
             B, _, T, _, _ = tensor.shape
             tensor = rearrange(tensor, "b c t h w -> (b t) c h w")
+        if tensor.device.type == "xpu":
+            tensor = tensor.cpu()
         tensor_rev = self.transform_rev(tensor).clamp_(0, 1)
         if B is not None:
             tensor_rev = rearrange(tensor_rev, "(b t) c h w -> b c t h w", b=B, t=T)

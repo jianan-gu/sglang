@@ -627,6 +627,8 @@ class ComponentResidencyManager:
             return
         if not torch.get_device_module().is_available():
             return
+        if current_platform.is_xpu():
+            return
         torch.get_device_module().empty_cache()
 
 

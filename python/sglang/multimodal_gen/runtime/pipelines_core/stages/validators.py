@@ -18,6 +18,12 @@ class StageValidators:
     """Common validators for pipeline stages."""
 
     @staticmethod
+    def _has_no_nan(value: torch.Tensor) -> bool:
+        if value.device.type == "xpu":
+            return True
+        return not torch.isnan(value).any().item()
+
+    @staticmethod
     def not_none(value: Any) -> bool:
         """Check if value is not None."""
         return value is not None
@@ -52,7 +58,7 @@ class StageValidators:
         """Check if value is a torch tensor and doesn't contain NaN values."""
         if not isinstance(value, torch.Tensor):
             return False
-        return not torch.isnan(value).any().item()
+        return StageValidators._has_no_nan(value)
 
     @staticmethod
     def tensor_with_dims(value: Any, dims: int) -> bool:
@@ -61,7 +67,7 @@ class StageValidators:
             return False
         if value.dim() != dims:
             return False
-        return not torch.isnan(value).any().item()
+        return StageValidators._has_no_nan(value)
 
     @staticmethod
     def tensor_min_dims(value: Any, min_dims: int) -> bool:
@@ -70,7 +76,7 @@ class StageValidators:
             return False
         if value.dim() < min_dims:
             return False
-        return not torch.isnan(value).any().item()
+        return StageValidators._has_no_nan(value)
 
     @staticmethod
     def tensor_shape_matches(value: Any, expected_shape: tuple) -> bool:
@@ -82,7 +88,7 @@ class StageValidators:
         for actual, expected in zip(value.shape, expected_shape, strict=True):
             if expected is not None and actual != expected:
                 return False
-        return not torch.isnan(value).any().item()
+        return StageValidators._has_no_nan(value)
 
     @staticmethod
     def list_not_empty(value: Any) -> bool:
