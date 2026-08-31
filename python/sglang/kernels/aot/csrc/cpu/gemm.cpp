@@ -1,5 +1,9 @@
 #include "gemm.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
 #include "common.h"
 #include "vec.h"
 
@@ -647,6 +651,91 @@ void weight_packed_linear_fp32_out_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+void fused_linear_relu_reduce_kernel_impl(
+    int64_t mb0,
+    int64_t mb1,
+    int64_t nb0,
+    int64_t nb1,
+    float* __restrict__ out,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k_packed,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    int64_t M,
+    int64_t H,
+    int64_t D,
+    int64_t N,
+    int64_t N_packed) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t q_strideM = H * D;
+  const fVec zero(0.f);
+  const int64_t kVecSize = fVec::size();
+
+  alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+  alignas(64) float Acc[BLOCK_M * BLOCK_N];
+
+  loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * D, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+    int64_t nb_start = nb * BLOCK_N;
+    int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+    // ldb must be the packed (physical) tile width, not the logical
+    // nb_size: they only differ on the tail tile when N isn't a multiple
+    // of BLOCK_N, and using nb_size there reads k_packed at the wrong
+    // stride (see mqa_logits_gemm_kv_range_kernel_impl's N_packed fix).
+    const int64_t nb_packed_size = std::min(N_packed - nb_start, BLOCK_N);
+
+    std::memset(Acc, 0, sizeof(float) * BLOCK_M * BLOCK_N);
+
+    for (int64_t h = 0; h < H; ++h) {
+      at::native::cpublas::brgemm(
+          mb_size,
+          nb_size,
+          D,
+          q_strideM,
+          nb_packed_size,
+          BLOCK_N,
+          /* add_C */ false,
+          q + mb_start * q_strideM + h * D,
+          k_packed + nb_start * D,
+          Ctmp);
+
+      for (int64_t i = 0; i < mb_size; ++i) {
+        const float w = q_scale[(mb_start + i) * H + h];
+        const fVec wv(w);
+        float* acc_row = Acc + i * BLOCK_N;
+        const float* c_row = Ctmp + i * BLOCK_N;
+        int64_t j = 0;
+        for (; j <= nb_size - kVecSize; j += kVecSize) {
+          fVec l = at::vec::maximum(fVec::loadu(c_row + j), zero);
+          fVec acc = fVec::loadu(acc_row + j);
+          acc = at::vec::fmadd(l, wv, acc);
+          acc.store(acc_row + j);
+        }
+        for (; j < nb_size; ++j) {
+          acc_row[j] += std::max(c_row[j], 0.f) * w;
+        }
+      }
+    }
+
+    for (int64_t i = 0; i < mb_size; ++i) {
+      const float* acc_row = Acc + i * BLOCK_N;
+      float* out_row = out + (mb_start + i) * N + nb_start;
+      int64_t j = 0;
+      for (; j <= nb_size - kVecSize; j += kVecSize) {
+        fVec acc = fVec::loadu(acc_row + j) * fVec::loadu(k_scale + nb_start + j);
+        acc.store(out_row + j);
+      }
+      for (; j < nb_size; ++j) {
+        out_row[j] = acc_row[j] * k_scale[nb_start + j];
+      }
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // tinygemm interface
@@ -752,6 +841,68 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   });
   return packed_weight;
 }
+
+// Fuses fp8_e4m3fn -> bf16 conversion with VNNI packing (pack_vnni<at::BFloat16>) into a
+// single pass over each tile, instead of materializing a full intermediate bf16 tensor and
+// packing it separately (the fp8_to_bf16-then-convert_weight_packed pattern previously
+// duplicated in mqa_logits.cpp / fp8_index.cpp).
+// weight_fp8 : [OC, IC] float8_e4m3fn, contiguous; OC is the *real* (unpadded) row count.
+// returns    : [OC_pad, IC] bf16, VNNI-packed; OC_pad is OC rounded up to TILE_N, pad rows zero.
+// parallelize_internally : true parallelizes the tile loop via at::parallel_for (for
+//     standalone/top-level callers); false runs it on the calling thread only, for callers
+//     that already provide their own outer parallelism (see fused_linear_relu_reduce's doc).
+template <bool parallelize_internally>
+at::Tensor convert_fp8_to_bf16_packed(at::Tensor& weight_fp8) {
+  CHECK_INPUT(weight_fp8);
+  TORCH_CHECK(weight_fp8.scalar_type() == at::kFloat8_e4m3fn, "expect weight_fp8 to be float8_e4m3fn.");
+  TORCH_CHECK(weight_fp8.dim() == 2, "expect weight_fp8 to be 2d.");
+
+  const int64_t OC = weight_fp8.size(0);
+  const int64_t IC = weight_fp8.size(1);
+  constexpr int64_t kTileN = TILE_N;
+  const int64_t OC_pad = div_up(OC, kTileN) * kTileN;
+
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t NB = div_up(OC_pad, BLOCK_N);
+
+  auto packed = at::empty({OC_pad, IC}, weight_fp8.options().dtype(at::kBFloat16));
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(weight_fp8.const_data_ptr());
+  at::BFloat16* dst = packed.data_ptr<at::BFloat16>();
+
+  // real_n rows are converted from fp8; the rest of the tile (padding beyond OC) is zeroed
+  // before packing so pack_vnni never reads uninitialized scratch.
+  auto pack_tile = [&](int64_t nb, at::BFloat16* __restrict__ scratch) {
+    const int64_t n_start = nb * BLOCK_N;
+    const int64_t n_size = std::min(BLOCK_N, OC_pad - n_start);
+    const int64_t real_n = std::clamp<int64_t>(OC - n_start, int64_t(0), n_size);
+
+    if (real_n > 0) {
+      fp8_to_bf16(scratch, src + n_start * IC, real_n * IC);
+    }
+    if (real_n < n_size) {
+      std::memset(scratch + real_n * IC, 0, (n_size - real_n) * IC * sizeof(at::BFloat16));
+    }
+    pack_vnni<at::BFloat16>(dst + n_start * IC, scratch, n_size, IC);
+  };
+
+  if constexpr (parallelize_internally) {
+    at::parallel_for(0, NB, 0, [&](int64_t begin, int64_t end) {
+      std::vector<at::BFloat16> scratch(BLOCK_N * IC);
+      for (int64_t nb = begin; nb < end; ++nb) {
+        pack_tile(nb, scratch.data());
+      }
+    });
+  } else {
+    std::vector<at::BFloat16> scratch(BLOCK_N * IC);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      pack_tile(nb, scratch.data());
+    }
+  }
+  return packed;
+}
+
+template at::Tensor convert_fp8_to_bf16_packed<true>(at::Tensor& weight_fp8);
+template at::Tensor convert_fp8_to_bf16_packed<false>(at::Tensor& weight_fp8);
 
 at::Tensor convert_scale_packed(at::Tensor& scale) {
   CHECK_INPUT(scale);
@@ -881,6 +1032,372 @@ at::Tensor weight_packed_linear(
   return out.view(input_sizes);
 }
 
+// Fused linear (GEMM) + relu + per-head weighted reduction
+// q       : [M, H, D] bf16/fp16
+// q_scale : [M, H] fp32
+// k       : [N_pad, D] bf16/fp16 (or VNNI-packed if is_vnni), N_pad must
+//           satisfy N_pad % TILE_N == 0 (the padding rows beyond
+//           k_scale.size(0) are packed but never read)
+// k_scale : [N] fp32, N <= k.size(0)
+// is_vnni : whether k is already VNNI-packed (skips convert_weight_packed)
+// out     : [M, N] fp32, pre-allocated contiguous output, written in place
+// parallelize_internally : true parallelizes the (M, N) tiling across threads
+//     via parallel_2d (for standalone/top-level callers). false runs the
+//     whole tiling on the calling thread only, for callers (e.g. one task per
+//     thread) that already provide their own outer parallelism: parallel_2d
+//     opens a raw #pragma omp parallel with no omp_in_parallel() guard, so
+//     nesting it under an already-active parallel region can silently leave
+//     part of (M, N) uncomputed instead of just running slower.
+template <bool parallelize_internally, bool is_vnni>
+void fused_linear_relu_reduce(
+    at::Tensor& out,
+    at::Tensor& q,
+    at::Tensor& q_scale,
+    at::Tensor& k,
+    at::Tensor& k_scale) {
+  CHECK_INPUT(q);
+  CHECK_INPUT(q_scale);
+  CHECK_INPUT(k);
+  CHECK_INPUT(k_scale);
+  CHECK_INPUT(out);
+  CHECK_DIM(3, q);
+  CHECK_DIM(2, q_scale);
+  CHECK_DIM(2, k);
+  CHECK_DIM(1, k_scale);
+  CHECK_DIM(2, out);
+
+  const int64_t M = q.size(0);
+  const int64_t H = q.size(1);
+  const int64_t D = q.size(2);
+  const int64_t N = k_scale.size(0);
+  TORCH_CHECK(k.size(1) == D, "k last dim must match q head_dim");
+  TORCH_CHECK(k.size(0) >= N, "k must have at least k_scale.size(0) rows");
+  TORCH_CHECK(q_scale.size(0) == M && q_scale.size(1) == H, "q_scale shape mismatch");
+  TORCH_CHECK(out.size(0) == M && out.size(1) == N, "out shape mismatch");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q/k dtype mismatch");
+
+  at::Tensor packed_k;
+  if constexpr (is_vnni) {
+    packed_k = k;
+  } else {
+    packed_k = convert_weight_packed(k);
+  }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "fused_linear_relu_reduce", [&] {
+    constexpr int64_t BLOCK_M = block_size_m();
+    constexpr int64_t BLOCK_N = block_size_n();
+    const int64_t MB = div_up(M, BLOCK_M);
+    const int64_t NB = div_up(N, BLOCK_N);
+
+    float* out_ptr = out.data_ptr<float>();
+    const scalar_t* q_ptr = q.data_ptr<scalar_t>();
+    const scalar_t* k_ptr = packed_k.data_ptr<scalar_t>();
+    const float* q_scale_ptr = q_scale.data_ptr<float>();
+    const float* k_scale_ptr = k_scale.data_ptr<float>();
+    const int64_t N_packed = k.size(0);
+
+    if constexpr (parallelize_internally) {
+      parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+        fused_linear_relu_reduce_kernel_impl<scalar_t>(
+            mb0, mb1, nb0, nb1, out_ptr, q_ptr, k_ptr, q_scale_ptr, k_scale_ptr, M, H, D, N, N_packed);
+        at::native::cpublas::brgemm_release();
+      });
+    } else {
+      fused_linear_relu_reduce_kernel_impl<scalar_t>(
+          0, MB, 0, NB, out_ptr, q_ptr, k_ptr, q_scale_ptr, k_scale_ptr, M, H, D, N, N_packed);
+      at::native::cpublas::brgemm_release();
+    }
+  });
+}
+
+template void fused_linear_relu_reduce<true, true>(at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+template void fused_linear_relu_reduce<true, false>(at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+template void fused_linear_relu_reduce<false, true>(at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+template void fused_linear_relu_reduce<false, false>(at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+
+namespace {
+
+// One request-local, request-boundary-aligned M-tile for
+// mqa_logits_gemm_kv_range: rows [row_start, row_start + row_size) all belong
+// to the same request (per cu_seqlens_q), so block_ks/block_ke (min/max of
+// ks/ke over the tile) can never span the gap between two different
+// requests' disjoint k-ranges.
+struct MqaRowTile {
+  int64_t row_start;
+  int64_t row_size;
+  int64_t block_ks;
+  int64_t block_ke;
+};
+
+// Builds request-boundary-aligned row-tiles (never straddling a request
+// boundary, unlike fused_linear_relu_reduce_kernel_impl's blind block_m
+// slicing) and returns exactly `at::get_num_threads()` groups of them,
+// balanced by cumulative KV-width*row-count cost rather than raw tile count
+// (tiles vary in row count - partial tiles at request ends - and KV width -
+// per-request context length - so an equal-tile-count split can be very
+// uneven). Both the running cost and the per-thread cost thresholds
+// (total_cost * ith / nth) are non-decreasing, so a single forward sweep
+// finds every cut point - no binary search - and `tiles`/`cost_prefix` are
+// reserved up front so they never reallocate while being filled.
+std::vector<std::vector<MqaRowTile>> schedule_mqa_row_tiles(
+    const int32_t* __restrict__ ks,
+    const int32_t* __restrict__ ke,
+    const int32_t* __restrict__ cu_seqlens_q,
+    int64_t batch_size,
+    int64_t block_m) {
+  // Upper bound on tile count: each request contributes at most one partial
+  // (non-full) tile beyond its exact block_m-sized tiles, so the total never
+  // exceeds div_up(M, block_m) + batch_size - reserve that much up front so
+  // the loop below (and cost_prefix alongside it) never reallocates.
+  const int64_t M = cu_seqlens_q[batch_size];
+  const int64_t max_tiles = div_up(M, block_m) + batch_size;
+
+  std::vector<MqaRowTile> tiles;
+  tiles.reserve(max_tiles);
+  std::vector<int64_t> cost_prefix;
+  cost_prefix.reserve(max_tiles + 1);
+  cost_prefix.push_back(0);
+  for (int64_t r = 0; r < batch_size; ++r) {
+    const int64_t row_begin = cu_seqlens_q[r];
+    const int64_t row_end = cu_seqlens_q[r + 1];
+    for (int64_t rs = row_begin; rs < row_end; rs += block_m) {
+      const int64_t rsize = std::min(block_m, row_end - rs);
+      int32_t mn = ks[rs];
+      int32_t mx = ke[rs];
+      for (int64_t i = rs + 1; i < rs + rsize; ++i) {
+        mn = std::min(mn, ks[i]);
+        mx = std::max(mx, ke[i]);
+      }
+      tiles.push_back({rs, rsize, mn, mx});
+      const int64_t width = std::max<int64_t>(0, static_cast<int64_t>(mx) - mn);
+      cost_prefix.push_back(cost_prefix.back() + width * rsize);
+    }
+  }
+
+  const int64_t nth = at::get_num_threads();
+  std::vector<std::vector<MqaRowTile>> groups(nth);
+  const int64_t num_tiles = static_cast<int64_t>(tiles.size());
+  const int64_t total_cost = cost_prefix[num_tiles];
+  if (num_tiles == 0 || total_cost == 0) {
+    return groups;
+  }
+
+  int64_t ith = 0;
+  for (int64_t t = 0; t < num_tiles; ++t) {
+    while (ith + 1 < nth && cost_prefix[t] >= total_cost * (ith + 1) / nth) {
+      ++ith;
+    }
+    groups[ith].push_back(tiles[t]);
+  }
+  return groups;
+}
+
+// Fully independent of fused_linear_relu_reduce_kernel_impl (same brgemm +
+// relu + weighted-reduce math, but tiled per-request and thread-balanced by
+// per-tile KV work instead of a fixed 2D grid) so that path is never touched.
+template <typename scalar_t>
+void mqa_logits_gemm_kv_range_kernel_impl(
+    float* __restrict__ out,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k_packed,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int32_t* __restrict__ ks,
+    const int32_t* __restrict__ ke,
+    const int32_t* __restrict__ cu_seqlens_q,
+    int64_t H,
+    int64_t D,
+    int64_t N,
+    int64_t N_packed,
+    int64_t batch_size) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t NB = div_up(N, BLOCK_N);
+  const int64_t q_strideM = H * D;
+  const fVec zero(0.f);
+  const int64_t kVecSize = fVec::size();
+
+  const auto tile_groups = schedule_mqa_row_tiles(ks, ke, cu_seqlens_q, batch_size, BLOCK_M);
+
+  const int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N * D);
+
+  auto process_tiles = [&](const std::vector<MqaRowTile>& tiles) {
+    alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+    alignas(64) float Acc[BLOCK_M * BLOCK_N];
+
+    // nbb-outer / tile-middle / nb-inner mirrors loop_2d's cache-blocking intent:
+    // a group of packed K columns stays resident in L2 across every tile this
+    // thread owns before moving to the next nbb group.
+    for (int64_t nbb = 0; nbb < NB; nbb += cache_blocks_nb) {
+      const int64_t nbb_end = std::min(nbb + cache_blocks_nb, NB);
+      for (const auto& tile : tiles) {
+        const int64_t row_start = tile.row_start;
+        const int64_t mb_size = tile.row_size;
+        if (tile.block_ke <= tile.block_ks) {
+          continue;
+        }
+
+        for (int64_t nb = nbb; nb < nbb_end; ++nb) {
+          const int64_t nb_start = nb * BLOCK_N;
+          const int64_t nb_packed_size = std::min(N_packed - nb_start, BLOCK_N);
+          const int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+          if (nb_start + nb_size <= tile.block_ks || nb_start >= tile.block_ke) {
+            continue;
+          }
+
+          std::memset(Acc, 0, sizeof(float) * BLOCK_M * BLOCK_N);
+          for (int64_t h = 0; h < H; ++h) {
+            at::native::cpublas::brgemm(
+                mb_size,
+                nb_size,
+                D,
+                q_strideM,
+              nb_packed_size,
+                BLOCK_N,
+                /* add_C */ false,
+                q + row_start * q_strideM + h * D,
+                k_packed + nb_start * D,
+                Ctmp);
+
+            for (int64_t i = 0; i < mb_size; ++i) {
+              const float w = q_scale[(row_start + i) * H + h];
+              const fVec wv(w);
+              float* acc_row = Acc + i * BLOCK_N;
+              const float* c_row = Ctmp + i * BLOCK_N;
+              int64_t j = 0;
+              for (; j <= nb_size - kVecSize; j += kVecSize) {
+                fVec l = at::vec::maximum(fVec::loadu(c_row + j), zero);
+                fVec acc = fVec::loadu(acc_row + j);
+                acc = at::vec::fmadd(l, wv, acc);
+                acc.store(acc_row + j);
+              }
+              for (; j < nb_size; ++j) {
+                acc_row[j] += std::max(c_row[j], 0.f) * w;
+              }
+            }
+          }
+
+          for (int64_t i = 0; i < mb_size; ++i) {
+            const float* acc_row = Acc + i * BLOCK_N;
+            float* out_row = out + (row_start + i) * N + nb_start;
+            int64_t j = 0;
+            for (; j <= nb_size - kVecSize; j += kVecSize) {
+              fVec acc = fVec::loadu(acc_row + j) * fVec::loadu(k_scale + nb_start + j);
+              acc.store(out_row + j);
+            }
+            for (; j < nb_size; ++j) {
+              out_row[j] = acc_row[j] * k_scale[nb_start + j];
+            }
+          }
+        }
+      }
+    }
+
+    at::native::cpublas::brgemm_release();
+  };
+
+  // Thread groups were precomputed (cost-balanced tiles per thread, no
+  // per-thread search left to do here) by schedule_mqa_row_tiles - just fan
+  // out over them.
+  const int64_t nth = static_cast<int64_t>(tile_groups.size());
+  at::parallel_for(0, nth, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t ith = begin; ith < end; ++ith) {
+      process_tiles(tile_groups[ith]);
+    }
+  });
+}
+
+}  // namespace
+
+// Fused GEMM + relu + per-head weighted reduction for the ragged (multi-request)
+// fp8 MQA logits op, with request-boundary-aligned KV-range block pruning (see
+// mqa_logits.cpp for the op-level contract). Fully standalone: does not share
+// code with, or modify, fused_linear_relu_reduce/fused_linear_relu_reduce_kernel_impl.
+// q            : [M, H, D] bf16/fp16
+// q_scale      : [M, H] fp32
+// k            : [N_pad, D] bf16/fp16 (or VNNI-packed if is_vnni)
+// k_scale      : [N] fp32, N <= k.size(0)
+// ks, ke       : [M] int32, per-query valid k-range [ks[i], ke[i))
+// cu_seqlens_q : [batch_size + 1] int32, per-request row-offset boundaries into M
+// is_vnni      : whether k is already VNNI-packed (skips convert_weight_packed)
+// out          : [M, N] fp32, pre-allocated contiguous output, written in place
+// (entries outside a row's own [ks[i], ke[i)) are left uninitialized - callers
+// must never read them, matching fp8_mqa_logits_cpu's existing contract)
+template <bool is_vnni>
+void mqa_logits_gemm_kv_range(
+    at::Tensor& out,
+    at::Tensor& q,
+    at::Tensor& q_scale,
+    at::Tensor& k,
+    at::Tensor& k_scale,
+    at::Tensor& ks,
+    at::Tensor& ke,
+    at::Tensor& cu_seqlens_q) {
+  CHECK_INPUT(q);
+  CHECK_INPUT(q_scale);
+  CHECK_INPUT(k);
+  CHECK_INPUT(k_scale);
+  CHECK_INPUT(ks);
+  CHECK_INPUT(ke);
+  CHECK_INPUT(cu_seqlens_q);
+  CHECK_INPUT(out);
+  CHECK_DIM(3, q);
+  CHECK_DIM(2, q_scale);
+  CHECK_DIM(2, k);
+  CHECK_DIM(1, k_scale);
+  CHECK_DIM(1, ks);
+  CHECK_DIM(1, ke);
+  CHECK_DIM(1, cu_seqlens_q);
+  CHECK_DIM(2, out);
+
+  const int64_t M = q.size(0);
+  const int64_t H = q.size(1);
+  const int64_t D = q.size(2);
+  const int64_t N = k_scale.size(0);
+  const int64_t N_packed = k.size(0);
+  TORCH_CHECK(k.size(1) == D, "k last dim must match q head_dim");
+  TORCH_CHECK(k.size(0) >= N, "k must have at least k_scale.size(0) rows");
+  TORCH_CHECK(q_scale.size(0) == M && q_scale.size(1) == H, "q_scale shape mismatch");
+  TORCH_CHECK(out.size(0) == M && out.size(1) == N, "out shape mismatch");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q/k dtype mismatch");
+  TORCH_CHECK(ks.size(0) == M, "ks must have shape [M]");
+  TORCH_CHECK(ke.sizes() == ks.sizes(), "ke must have the same shape as ks");
+  TORCH_CHECK(ks.scalar_type() == at::kInt && ke.scalar_type() == at::kInt, "ks/ke must be int32");
+  TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32");
+  TORCH_CHECK(cu_seqlens_q.size(0) >= 1, "cu_seqlens_q must have at least 1 element");
+
+  const int64_t batch_size = cu_seqlens_q.size(0) - 1;
+  at::Tensor packed_k;
+  if constexpr (is_vnni) {
+    packed_k = k;
+  } else {
+    packed_k = convert_weight_packed(k);
+  }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "mqa_logits_gemm_kv_range", [&] {
+    mqa_logits_gemm_kv_range_kernel_impl<scalar_t>(
+        out.data_ptr<float>(),
+        q.data_ptr<scalar_t>(),
+        packed_k.data_ptr<scalar_t>(),
+        q_scale.data_ptr<float>(),
+        k_scale.data_ptr<float>(),
+        ks.data_ptr<int32_t>(),
+        ke.data_ptr<int32_t>(),
+        cu_seqlens_q.data_ptr<int32_t>(),
+        H,
+        D,
+        N,
+        N_packed,
+        batch_size);
+  });
+}
+
+template void mqa_logits_gemm_kv_range<true>(
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+template void mqa_logits_gemm_kv_range<false>(
+    at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
+
 // mat1         : [M, K]
 // mat2         : [K, 1]
 // post_mul_mat : [M, K]
@@ -894,7 +1411,7 @@ at::Tensor fused_linear_sigmoid_mul(
     bool is_vnni,
     const at::Tensor& post_mul_mat) {
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
-  TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight")
+  TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight");
 
   int64_t M = mat1.size(0);
   int64_t K = mat1.size(1);
@@ -912,7 +1429,7 @@ at::Tensor fused_linear_sigmoid_mul(
 
   TORCH_CHECK(
       N == 1 && out_strideM % 32 == 0,
-      "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)")
+      "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)");
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
