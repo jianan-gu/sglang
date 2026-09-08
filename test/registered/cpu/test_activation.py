@@ -44,6 +44,24 @@ def test_activation(m, n, dtype):
     )
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_clamped_silu_and_mul(dtype):
+    limit = 3.0
+    gate = torch.tensor(
+        [[-10.0, -limit, 0.0, limit, 10.0], [10.0, 0.0, -limit, -10.0, limit]], dtype=dtype
+    )
+    up = torch.tensor(
+        [[-10.0, -limit * 2, 0.0, limit, 10.0], [limit * 2, 0.0, -10.0, -limit, -limit * 2]],
+        dtype=dtype,
+    )
+    x = torch.cat([gate, up], dim=-1)
+    clamped_gate = torch.clamp(gate, max=limit)
+    ref = clamped_gate * torch.sigmoid(clamped_gate) * torch.clamp(up, -limit, limit)
+
+    out = torch.ops.sgl_kernel.clamped_silu_and_mul_cpu(x, limit)
+    _assert_close(ref, out)
+
+
 @pytest.mark.parametrize("gate_3d", [False, True])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("head_dim", [256])
