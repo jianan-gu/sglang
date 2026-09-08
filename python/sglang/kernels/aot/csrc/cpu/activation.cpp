@@ -1,4 +1,5 @@
 #include "common.h"
+#include "activation.h"
 #include "vec.h"
 
 namespace {
@@ -115,6 +116,29 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
         d,
         [](float x) { return x / (1.f + std::exp(-x)); },
         [](Vec x) { return fast_silu(x); });
+  });
+  return out;
+}
+
+at::Tensor clamped_silu_and_mul_cpu(const at::Tensor& input, double limit) {
+  CHECK_DIM(2, input);
+  CHECK_CONTIGUOUS(input);
+  TORCH_CHECK(input.size(-1) % 2 == 0, "input last dimension must be even");
+
+  auto sizes = input.sizes().vec();
+  const int64_t d = sizes.back() / 2;
+  sizes.back() = d;
+  at::Tensor out = at::empty(sizes, input.options());
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "clamped_silu_and_mul", [&] {
+    const int64_t num_tokens = input.size(0);
+    const scalar_t* input_ptr = input.data_ptr<scalar_t>();
+    scalar_t* out_ptr = out.data_ptr<scalar_t>();
+    for (int64_t token = 0; token < num_tokens; ++token) {
+      const scalar_t* token_input = input_ptr + token * 2 * d;
+      clamped_silu_and_mul_stub(
+          out_ptr + token * d, token_input, token_input + d, d, static_cast<float>(limit));
+    }
   });
   return out;
 }
